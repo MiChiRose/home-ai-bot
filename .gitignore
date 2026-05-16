@@ -1,0 +1,29 @@
+# Secrets — НИКОГДА в repo
+.env
+.env.*
+!.env.example
+!.env.example.tools
+*.bak-*
+
+# Local state
+data/bot.db
+data/bot.db-*
+data/*.sqlite
+logs/
+*.log
+
+# venv и cache
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# P3/P5 runtime stuff
+updates/pending/
+updates/done/
+updates/failed/
+backups/
+
+# OS
+.DS_Store
+Thumbs.db
