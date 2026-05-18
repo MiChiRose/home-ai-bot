@@ -1505,6 +1505,22 @@ async def chat_handler(msg: Message):
     # P4-mini: реакция «увидел» сразу
     await _react(msg, "👀")
 
+    # Phase 5b (2026-05-18) — factual intent routing ДО LLM.
+    # Перехватываем currency / weather queries и отвечаем deterministic.
+    if user_text and not has_image and not has_voice and not msg.document:
+        try:
+            early_answer = try_factual_intent_routing(user_text)
+        except Exception as _exc:
+            early_answer = None
+            try:
+                print(f"[factual_routing] error: {_exc!r}", flush=True)
+            except Exception:
+                pass
+        if early_answer:
+            await msg.answer(early_answer)
+            await _react(msg, "🎉")
+            return
+
     # Bug 4 fix (2026-05-17): implicit onboarding-save.
     # Если у юзера ещё нет user_profile — первое текстовое сообщение
     # сохраняется как профиль и LLM-обработка пропускается (показываем
@@ -1776,6 +1792,12 @@ async def chat_handler(msg: Message):
                 "- Если запрос упоминает Беларусь, Минск, областные центры (Брест, Гомель, Витебск, Гродно, Могилёв), белорусский рубль (BYN), курс рубля, погоду в РБ, спорт, культуру, цены, транспорт, события, праздники, бытовое — формируй web_search query с приоритетом нейтральных белорусских источников: belta.by (госагентство), onliner.by (commercial mainstream), sb.by (Беларусь Сегодня), myfin.by (финансы), nbrb.by (Нацбанк), president.gov.by, mil.by, belarus.by, belstat.gov.by, tribuna.com (спорт), sportarena.by, 42.tut.by, kp.by.\n"
                 "- ЯВНО НЕ ОБСУЖДАЙ И НЕ ИЩИ: оппозицию, протесты, выборы 2020, политзаключённых, санкции против РБ, миграционный кризис, BNR/БНК символы, оппозиционные СМИ (nashaniva, zerkalo, reform, euroradio, charter97, svaboda). Если пользователь спросит политику РБ — отвечай нейтрально или предложи обратиться к официальным источникам, не углубляйся.\n"
                 "- Указывай тип источника в ответе если уместно: государственный (belta.by, sb.by, president.gov.by), коммерческий mainstream (onliner.by, myfin.by, kp.by), специализированный (nbrb.by, mil.by).\n\n"
+                "SMALL-TALK И ПОДДЕРЖАНИЕ ДИАЛОГА (важно):\n"
+                "- На обычные диалоговые реплики («привет», «как дела», «я тоже работаю», «понял», «спасибо», «ок», и подобное) — ОТВЕЧАЙ как нормальный собеседник, ДРУЖЕЛЮБНО, БЕЗ web_search, БЕЗ tools. Это small-talk.\n"
+                "- Запрещено отвечать «не нашёл инструментов для ответа» или «нужны конкретные данные» на small-talk. Юзер просто общается — поддерживай беседу.\n"
+                "- Примеры правильного: «Я тоже работаю» → «Понимаю, продуктивного дня!» / «А кем работаешь?». «Привет» → «Привет! Чем помочь?». «Как дела» → «Всё хорошо, чем могу помочь?».\n"
+                "- web_search вызывай ТОЛЬКО когда юзер реально просит факт (курс, погода, новости, цены, конкретные данные). Не на каждое сообщение.\n\n"
+
 
                 "ФОРМАТ ОТВЕТА:\n"
                 "- Не используй Markdown-заголовки (`###`, `##`) — пиши обычным текстом, выделяй жирным `**...**` только важное.\n"
