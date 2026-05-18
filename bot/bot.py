@@ -1034,13 +1034,16 @@ def _detect_currency_token(text: str) -> str:
     return "USD"  # default
 
 
-def _detect_city_token(text: str) -> str:
+def _detect_city_token(text: str) -> str | None:
+    """WEATHER_FALLTHROUGH v9 2026-05-18.
+    Возвращает беларуский город из текста, или None если не найден
+    (тогда intent routing fall through'нет к LLM)."""
     text_lower = text.lower()
     cities = ["минск", "брест", "гомель", "витебск", "гродно", "могилёв", "могилев"]
     for city in cities:
         if city in text_lower:
             return city.capitalize()
-    return "Минск"  # default
+    return None  # let LLM handle non-Belarus cities via web_search
 
 
 
@@ -1115,6 +1118,8 @@ def try_factual_intent_routing(user_text: str):
         return get_nbrb_rate(cur, date=date)
     if _WEATHER_INTENT_RE.search(user_text):
         city = _detect_city_token(user_text)
+        if city is None:
+            return None  # WEATHER_FALLTHROUGH v9: не-беларуский город → к LLM с web_search
         return get_gismeteo_weather(city)
     return None
 async def _run_cmd(args: list[str], cwd: str | None = None, timeout: int = 60) -> tuple[int, str, str]:
