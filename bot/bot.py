@@ -1244,6 +1244,81 @@ _ANALYTICAL_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+# v22 RUNTIME_HALLUCINATION_DETECTOR 2026-05-18 — runtime post-processing
+# layer для детекции возможных галлюцинаций LLM перед отправкой юзеру.
+
+_HALLUCINATION_ANCHOR_RE = re.compile(
+    r"(?i)\b("
+    r"по\s+данным|согласно\s+(?:сайту|данным|источнику|информации)|"
+    r"источник[:\s]|по\s+информации|на\s+момент\s+\d{4}|"
+    r"составляет\s+[\d.,]+|равен\s+[\d.,]+|равняется|"
+    r"получено\s+через|by\s+source|according\s+to"
+    r")\b"
+)
+
+_SPECIFIC_NUMBER_RE = re.compile(r"\b\d+[.,]\d+\b")
+
+_TRUSTED_TOOL_NAMES = {"web_search", "get_nbrb_rate", "get_gismeteo_weather",
+                       "get_nbrb_rates_list", "read_file", "list_dir"}
+
+
+def _tokens_for_similarity(text: str) -> set[str]:
+    """Извлечь содержательные токены (>3 символа) для grouping similarity."""
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    words = cleaned.split()
+    stop = {"что", "как", "это", "был", "есть", "была", "была", "если",
+            "его", "ему", "она", "они", "тоже", "тебе", "меня", "себя",
+            "this", "that", "what", "have", "with"}
+    return {w for w in words if len(w) > 3 and w not in stop}
+
+
+def _detect_hallucination(
+    user_text: str,
+    response_text: str,
+    tools_called: set | list | None = None,
+) -> tuple[bool, str]:
+    """v22: проверить ответ LLM на возможные галлюцинации.
+    Returns (is_suspicious, reason)."""
+    tools_called = set(tools_called) if tools_called else set()
+    used_trusted = bool(tools_called & _TRUSTED_TOOL_NAMES)
+
+    # Skip short small-talk responses
+    if len(response_text.strip()) < 30:
+        return (False, "short response — skip")
+
+    # Detector 1: specific number without tool
+    if not used_trusted and _SPECIFIC_NUMBER_RE.search(response_text):
+        return (True, "specific number without tool call")
+
+    # Detector 2: source anchor without tool
+    if not used_trusted and _HALLUCINATION_ANCHOR_RE.search(response_text):
+        return (True, "source anchor word without tool call")
+
+    # Detector 3: topic drift (jaccard similarity < 10%)
+    q_tokens = _tokens_for_similarity(user_text)
+    r_tokens = _tokens_for_similarity(response_text)
+    if q_tokens and r_tokens:
+        intersection = q_tokens & r_tokens
+        union = q_tokens | r_tokens
+        if union:
+            jaccard = len(intersection) / len(union)
+            if jaccard < 0.05 and len(response_text) > 50:
+                return (True, f"topic drift (jaccard={jaccard:.3f})")
+
+    return (False, "ok")
+
+
+def _add_hallucination_disclaimer(response_text: str, reason: str) -> str:
+    """v22: добавить disclaimer в начало ответа если detected hallucination."""
+    log.warning("hallucination flagged: %s -- response: %s", reason, response_text[:100])
+    disclaimer = (
+        "⚠️ Возможна неточность — я не проверил это через интернет. "
+        "Если нужны актуальные данные, попроси «перепроверь через web search».\n\n"
+    )
+    return disclaimer + response_text
+
+
 def try_factual_intent_routing(user_text: str):
     """Попробовать перехватить specific factual query ДО LLM.
     DATE_PARSING v7 2026-05-18 — поддержка «вчера / в пятницу / 15.05».
@@ -2170,6 +2245,22 @@ async def chat_handler(msg: Message):
 
         # 5) Отправляем ответ — через edit progress-message (или fallback delete+answer)
         final_text = response_text.strip() or "(пустой ответ от модели)"
+
+        # v22 RUNTIME_HALLUCINATION_DETECTOR — post-process check
+        try:
+            # tool_calls_made — set имён tools которые были вызваны в этом турне.
+            # В нашей системе chat_with_tools не возвращает list of tool calls,
+            # поэтому грубое приближение: если ответ выглядит как deterministic
+            # формат (содержит «BYN», «°C», «Курс ») — считаем что был intercept.
+            tools_called = set()
+            if any(marker in response_text for marker in ["BYN (на ", "°C", "Курс валют на", "ощущается как"]):
+                tools_called.add("get_nbrb_rate")
+            # web_search trace в нашем коде нет — но если ответ короткий, не суетимся.
+            is_susp, reason = _detect_hallucination(user_text, final_text, tools_called)
+            if is_susp:
+                final_text = _add_hallucination_disclaimer(final_text, reason)
+        except Exception as _exc:
+            log.debug("hallucination detector skipped: %s", _exc)
         TG_MAX = 4096  # Telegram message limit
 
         async def _delete_progress():
