@@ -1,0 +1,392 @@
+"""Feature pack v1 для home-ai-bot — middleware'ы + /health + /reload_responses."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import time
+import urllib.request
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, TelegramObject
+
+BOT_REPO = Path(os.environ.get("BOT_REPO_DIR", str(Path.home() / "ai-assistant")))
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "5"))
+RATE_LIMIT_WINDOW = 60
+CONCURRENCY_PER_USER = int(os.environ.get("CONCURRENCY_PER_USER", "1"))
+MIN_VRAM_MB = int(os.environ.get("MIN_VRAM_MB", "1500"))
+TYPING_INTERVAL = 4.0
+GPU_CHECK_CACHE_TTL = 2.0
+DEFAULT_RESPONSES_PATH = BOT_REPO / "data" / "common_responses.json"
+RESPONSES_PATH = Path(os.environ.get("CANNED_RESPONSES_PATH", str(DEFAULT_RESPONSES_PATH)))
+
+
+@dataclass
+class FeatureStats:
+    started_at: float = field(default_factory=time.time)
+    rate_limit_blocked: int = 0
+    concurrency_blocked: int = 0
+    canned_hits: int = 0
+    gpu_blocked: int = 0
+    typing_actions_sent: int = 0
+    total_messages_seen: int = 0
+
+
+STATS = FeatureStats()
+
+
+def _is_command(text):
+    return bool(text and text.startswith("/"))
+
+
+def _format_uptime(seconds):
+    s = int(seconds)
+    if s < 60: return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60: return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    if h < 24: return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h {m}m"
+
+
+def _normalize_text(s):
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[!?.,;:\-—\(\)\[\]\"']+$", "", s)
+    s = re.sub(r"^[!?.,;:\-—\(\)\[\]\"']+", "", s)
+    return s.strip()
+
+
+class TypingActionMiddleware:
+    def __init__(self, bot):
+        self._bot = bot
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message) or _is_command(event.text):
+            return await handler(event, data)
+        chat_id = event.chat.id
+
+        async def _typer():
+            try:
+                while True:
+                    try:
+                        await self._bot.send_chat_action(chat_id, "typing")
+                        STATS.typing_actions_sent += 1
+                    except Exception:
+                        pass
+                    await asyncio.sleep(TYPING_INTERVAL)
+            except asyncio.CancelledError:
+                pass
+
+        typer_task = asyncio.create_task(_typer())
+        try:
+            return await handler(event, data)
+        finally:
+            typer_task.cancel()
+            try:
+                await typer_task
+            except Exception:
+                pass
+
+
+class RateLimitMiddleware:
+    def __init__(self, max_per_window=RATE_LIMIT_PER_MIN, window_sec=RATE_LIMIT_WINDOW):
+        self.max_per_window = max_per_window
+        self.window_sec = window_sec
+        self._hits = defaultdict(deque)
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message): return await handler(event, data)
+        if _is_command(event.text): return await handler(event, data)
+        if not event.from_user: return await handler(event, data)
+
+        STATS.total_messages_seen += 1
+        user_id = event.from_user.id
+        now = time.time()
+        bucket = self._hits[user_id]
+        while bucket and now - bucket[0] > self.window_sec:
+            bucket.popleft()
+        if len(bucket) >= self.max_per_window:
+            STATS.rate_limit_blocked += 1
+            wait = int(self.window_sec - (now - bucket[0])) + 1
+            try:
+                await event.answer(
+                    f"⏱ Слишком быстро. Лимит {self.max_per_window} сообщений в "
+                    f"{self.window_sec}с. Подожди ~{wait}с."
+                )
+            except Exception:
+                pass
+            return None
+        bucket.append(now)
+        return await handler(event, data)
+
+
+class ConcurrencyMiddleware:
+    def __init__(self, max_per_user=CONCURRENCY_PER_USER):
+        self.max_per_user = max_per_user
+        self._sems = {}
+        self._active = defaultdict(int)
+
+    def _sem(self, user_id):
+        sem = self._sems.get(user_id)
+        if sem is None:
+            sem = asyncio.Semaphore(self.max_per_user)
+            self._sems[user_id] = sem
+        return sem
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message): return await handler(event, data)
+        if _is_command(event.text): return await handler(event, data)
+        if not event.from_user: return await handler(event, data)
+
+        user_id = event.from_user.id
+        sem = self._sem(user_id)
+        if sem.locked():
+            STATS.concurrency_blocked += 1
+            try:
+                await event.answer("⏳ Уже обрабатываю твой предыдущий запрос. Подожди ответа.")
+            except Exception:
+                pass
+            return None
+        async with sem:
+            self._active[user_id] += 1
+            try:
+                return await handler(event, data)
+            finally:
+                self._active[user_id] -= 1
+                if self._active[user_id] <= 0:
+                    self._active.pop(user_id, None)
+
+    @property
+    def active_count(self):
+        return sum(self._active.values())
+
+
+class CannedResponses:
+    def __init__(self, path):
+        self.path = path
+        self.patterns = []
+        self.reload()
+
+    def reload(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.patterns = data.get("patterns", [])
+            return True, f"загружено {len(self.patterns)} паттернов"
+        except FileNotFoundError:
+            self.patterns = []
+            return False, f"файл не найден: {self.path}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def match(self, text):
+        norm = _normalize_text(text)
+        if not norm: return None
+        tokens = set(norm.split())
+        for entry in self.patterns:
+            mtype = entry.get("match_type", "exact_word")
+            matches = entry.get("match", [])
+            responses = entry.get("responses", [])
+            if not matches or not responses: continue
+            hit = False
+            if mtype == "exact_phrase":
+                hit = norm in {_normalize_text(m) for m in matches}
+            elif mtype == "exact_word":
+                if len(tokens) <= 4:
+                    targets = {_normalize_text(m) for m in matches}
+                    hit = bool(tokens & targets)
+            elif mtype == "contains":
+                hit = any(_normalize_text(m) in norm for m in matches)
+            if hit:
+                return random.choice(responses)
+        return None
+
+
+class CannedResponseMiddleware:
+    def __init__(self, store):
+        self.store = store
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message): return await handler(event, data)
+        if not event.text or _is_command(event.text): return await handler(event, data)
+        response = self.store.match(event.text)
+        if response is None: return await handler(event, data)
+        STATS.canned_hits += 1
+        try:
+            await event.answer(response)
+        except Exception:
+            pass
+        return None
+
+
+class GPUGuard:
+    def __init__(self, min_vram_mb=MIN_VRAM_MB, ttl=GPU_CHECK_CACHE_TTL):
+        self.min_vram_mb = min_vram_mb
+        self.ttl = ttl
+        self._cached_at = 0.0
+        self._cached_value = None
+        self._has_nvidia_smi = shutil.which("nvidia-smi") is not None
+
+    def vram_free_mb(self):
+        if not self._has_nvidia_smi: return None
+        now = time.time()
+        if now - self._cached_at < self.ttl and self._cached_value is not None:
+            return self._cached_value
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode != 0:
+                self._cached_at = now
+                self._cached_value = None
+                return None
+            first = out.stdout.strip().split("\n")[0].strip()
+            val = int(first)
+            self._cached_at = now
+            self._cached_value = val
+            return val
+        except Exception:
+            self._cached_at = now
+            self._cached_value = None
+            return None
+
+
+class GPUGuardMiddleware:
+    def __init__(self, guard):
+        self.guard = guard
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message) or _is_command(event.text):
+            return await handler(event, data)
+        free = self.guard.vram_free_mb()
+        if free is None: return await handler(event, data)
+        if free < self.guard.min_vram_mb:
+            STATS.gpu_blocked += 1
+            try:
+                await event.answer(
+                    f"🖥 GPU перегружена: свободно {free} MB (нужно ≥{self.guard.min_vram_mb}). "
+                    f"Подожди минуту."
+                )
+            except Exception:
+                pass
+            return None
+        return await handler(event, data)
+
+
+def _ollama_status():
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/ps", timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        models = data.get("models", [])
+        if not models: return "0 моделей загружено"
+        names = ", ".join(m.get("name", "?") for m in models)
+        return f"{len(models)} model(s): {names}"
+    except Exception as e:
+        return f"недоступна ({type(e).__name__})"
+
+
+def _system_load():
+    try:
+        load = os.getloadavg()
+        return f"{load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}"
+    except Exception:
+        return "n/a"
+
+
+def _meminfo_mb():
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k.strip()] = int(v.strip().split()[0])
+        total = info.get("MemTotal", 0) // 1024
+        avail = info.get("MemAvailable", 0) // 1024
+        return avail, total
+    except Exception:
+        return None
+
+
+def register_health_command(dp, bot, admin_ids, gpu_guard, concurrency_mw, canned):
+    @dp.message(Command("health"))
+    async def _health(message):
+        if not message.from_user or message.from_user.id not in admin_ids:
+            await message.answer("⛔ только для админа")
+            return
+        uptime = _format_uptime(time.time() - STATS.started_at)
+        vram = gpu_guard.vram_free_mb()
+        vram_str = f"{vram} MB свободно" if vram is not None else "nvidia-smi недоступен"
+        mem = _meminfo_mb()
+        mem_str = f"{mem[0]}/{mem[1]} MB" if mem else "n/a"
+        ollama = _ollama_status()
+        load = _system_load()
+        total_seen = STATS.total_messages_seen
+        cache_pct = (STATS.canned_hits * 100 / total_seen) if total_seen else 0
+        lines = [
+            "🩺 <b>Health</b>",
+            f"• Uptime: <code>{uptime}</code>",
+            f"• VRAM: <code>{vram_str}</code>",
+            f"• RAM: <code>{mem_str}</code>",
+            f"• Load avg: <code>{load}</code>",
+            f"• Ollama: <code>{ollama}</code>",
+            "",
+            f"• Canned кэш-хитов: <b>{STATS.canned_hits}</b> ({cache_pct:.0f}% от {total_seen})",
+            f"• Rate-limit блок: <b>{STATS.rate_limit_blocked}</b>",
+            f"• Concurrency блок: <b>{STATS.concurrency_blocked}</b>",
+            f"• GPU guard блок: <b>{STATS.gpu_blocked}</b>",
+            f"• Typing-actions sent: <b>{STATS.typing_actions_sent}</b>",
+            f"• Активных запросов сейчас: <b>{concurrency_mw.active_count}</b>",
+            "",
+            f"• Canned patterns: <b>{len(canned.patterns)}</b> (<code>{canned.path}</code>)",
+        ]
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+def register_reload_responses_command(dp, bot, admin_ids, canned):
+    @dp.message(Command("reload_responses"))
+    async def _reload(message):
+        if not message.from_user or message.from_user.id not in admin_ids:
+            await message.answer("⛔ только для админа")
+            return
+        ok, info = canned.reload()
+        marker = "✅" if ok else "❌"
+        await message.answer(f"{marker} reload_responses: {info}")
+
+
+def setup_feature_pack(dp, bot, admin_ids, responses_path=None):
+    admin_set = {int(x) for x in admin_ids if str(x).lstrip("-").isdigit()}
+    path = responses_path or RESPONSES_PATH
+    canned = CannedResponses(path)
+    rate_mw = RateLimitMiddleware()
+    conc_mw = ConcurrencyMiddleware()
+    canned_mw = CannedResponseMiddleware(canned)
+    gpu = GPUGuard()
+    gpu_mw = GPUGuardMiddleware(gpu)
+    typing_mw = TypingActionMiddleware(bot)
+
+    dp.message.middleware(rate_mw)
+    dp.message.middleware(conc_mw)
+    dp.message.middleware(canned_mw)
+    dp.message.middleware(gpu_mw)
+    dp.message.middleware(typing_mw)
+
+    register_health_command(dp, bot, admin_set, gpu, conc_mw, canned)
+    register_reload_responses_command(dp, bot, admin_set, canned)
+
+    print(
+        f"[features_pack] установлено: rate={RATE_LIMIT_PER_MIN}/{RATE_LIMIT_WINDOW}s, "
+        f"concurrency={CONCURRENCY_PER_USER}/user, min_vram={MIN_VRAM_MB}MB, "
+        f"canned={len(canned.patterns)} patterns (from {path})"
+    )

@@ -630,13 +630,6 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# --- patch_runner hookup (auto-injected by inject_patch_runner.py) ---
-from pathlib import Path as _PR_Path
-from patch_runner_handler import register_patch_runner as _pr_register
-_pr_patches_dir = _PR_Path(__file__).parent.parent / "patches-incoming"
-_pr_register(dp, bot, _pr_patches_dir, 263280027)
-# --- end patch_runner hookup ---
-
 # --- file_clone hookup (auto-injected by inject-file-clone.sh) ---
 from pathlib import Path as _FC_Path
 from file_clone_handler import register_file_clone as _fc_register
@@ -1479,37 +1472,6 @@ async def chat_handler(msg: Message):
                     )
             except Exception as e:
                 log.warning("save to ~/Documents failed: %s", e)
-
-        # Юра msg 17477: auto-copy admin uploads of .sh/.py/.bash/.patch в
-        # patches-incoming/ — для использования с /list_patches + /run_patch.
-        if msg.document and await db_is_admin(user_id):
-            try:
-                _patch_exts = {".sh", ".py", ".bash", ".patch"}
-                from pathlib import Path as _PR_Path
-                _fname = (msg.document.file_name or "").lower()
-                _ext = _PR_Path(_fname).suffix
-                if _ext in _patch_exts:
-                    _pr_inbox = _PR_Path(__file__).parent.parent / "patches-incoming"
-                    _pr_inbox.mkdir(parents=True, exist_ok=True)
-                    _pr_safe_name = "".join(c if c.isalnum() or c in "._- " else "_"
-                                            for c in (msg.document.file_name or f"patch-{int(time.time())}{_ext}"))
-                    _pr_target = _pr_inbox / _pr_safe_name.strip()
-                    if _pr_target.exists():
-                        _pr_target = _pr_inbox / f"{_pr_target.stem}-{int(time.time())}{_pr_target.suffix}"
-                    _pr_tg_file = await bot.get_file(msg.document.file_id)
-                    _pr_buf = await bot.download_file(_pr_tg_file.file_path)
-                    _pr_target.write_bytes(_pr_buf.read())
-                    _pr_size_kb = _pr_target.stat().st_size // 1024
-                    log.info("patch saved to patches-incoming: %s (%s KB)", _pr_target, _pr_size_kb)
-                    await msg.answer(
-                        f"📥 Принят patch: <code>{_pr_target.name}</code>\n"
-                        f"Сохранён в <code>patches-incoming/</code> ({_pr_size_kb} KB).\n\n"
-                        f"Запустить: <code>/run_patch {_pr_target.name}</code>\n"
-                        f"Список:    <code>/list_patches</code>"
-                    )
-            except Exception as e:
-                log.warning("patch auto-save failed: %s", e)
-
 
         # P3: document handling — если приехал PDF/DOCX, скачиваем в sandbox/uploads/
         # и подменяем user_text на инструкцию модели read_pdf/read_docx.

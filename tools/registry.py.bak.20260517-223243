@@ -7,7 +7,6 @@ from .file_ops import read_file, write_file, list_dir, search_files
 from .document_ops import read_pdf, read_docx, write_docx
 from .image_gen import generate_image
 from .web_search import web_search
-from .html_gen import generate_html_page
 
 
 TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -15,7 +14,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Поиск свежих данных в интернете. ✅ ВЫЗЫВАТЬ на запросы про актуальный курс, погоду, новости, цены, события сегодня/вчера/сейчас. ❌ НЕ вызывать на общие вопросы где достаточно знаний из training data. Tool name строго `web_search` (snake_case).",
+            "description": "Поиск актуальной информации в интернете. Использовать, когда нужны свежие данные, новости, цены, факты после твоего knowledge cutoff.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -44,7 +43,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Записать (перезаписать) текстовый файл в песочнице. ⚠️ ВЫЗЫВАТЬ ТОЛЬКО если юзер ЯВНО попросил сохранить что-то в файл. ЗАПРЕЩЕНО на короткие реакции / по своей инициативе. Папки создаются автоматически.",
+            "description": "Записать (перезаписать) текстовый файл в песочнице пользователя. Папки создаются автоматически.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -116,7 +115,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_docx",
-            "description": "Создать DOCX-файл в песочнице. ⚠️ ВЫЗЫВАТЬ ТОЛЬКО если юзер ЯВНО попросил документ/docx/отчёт/файл/составить/подготовить. ЗАПРЕЩЕНО вызывать на короткие реакции («Супер!», «Окей», «Класс», «Спасибо», 1-2 слова восклицания) — это user reaction, не запрос на файл. Если сомневаешься — не вызывай. В content можно использовать markdown-like: '# H1', '## H2', '- буллет'.",
+            "description": "Создать DOCX файл в песочнице пользователя. По соглашению клади результат в output/ — bot.py автоматом отправит файл юзеру в Telegram. В content можно использовать markdown-like структуру: '# Заголовок 1', '## Заголовок 2', '- буллет'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -132,7 +131,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Сгенерировать изображение через Stable Diffusion 3. ⚠️ ВЫЗЫВАТЬ ТОЛЬКО если юзер ЯВНО попросил «нарисуй», «сгенерируй картинку», «создай изображение», «нужна иллюстрация». ЗАПРЕЩЕНО вызывать на короткие реакции или без explicit запроса на визуал.",
+            "description": "Сгенерировать изображение через локальный Stable Diffusion 3. Использовать когда юзер просит создать/нарисовать/сгенерировать картинку. Возвращает путь — bot.py автоматически пришлёт картинку в Telegram.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -145,23 +144,6 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_html_page",
-            "description": "Сгенерировать одностраничный HTML-сайт по описанию (inline CSS, без внешних зависимостей). ✅ ВЫЗЫВАТЬ если юзер ЯВНО просит «сделай сайт/страницу/landing/HTML/одностраничник». ❌ НЕ вызывать на короткие реакции или без explicit запроса на веб-страницу.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title":         {"type": "string", "description": "Заголовок страницы (тег <title>)."},
-                    "content_brief": {"type": "string", "description": "Что юзер хочет видеть на странице — секции, тексты, цвета, стиль. Чем подробнее — тем лучше."},
-                    "filename":      {"type": "string", "description": "Имя файла без расширения (например 'portfolio'). По умолчанию 'page'.", "default": "page"},
-                },
-                "required": ["title", "content_brief"],
-            },
-        },
-    },
-
 ]
 
 _FUNCS = {
@@ -174,7 +156,6 @@ _FUNCS = {
     "read_docx":    read_docx,
     "write_docx":   write_docx,
     "generate_image": generate_image,
-    "generate_html_page": generate_html_page,
 }
 
 

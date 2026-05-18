@@ -147,62 +147,48 @@ def md_to_tg_html(text: str) -> str:
 
 
 def strip_tool_call_leaks(text: str) -> str:
-    """Удаляет orphan tool-call JSON в plain text (включая Llama-style с
-    'parameters' и 'name' без 'arguments'), плюс strip иероглифов и фраз
-    объявления процесса работы («я вызову инструмент X»)."""
+    """Удаляет orphan tool-call JSON + strip иероглифов (CJK/Hangul/Hebrew/Arabic/Devanagari/Thai).
+    Qwen2.5 периодически дрейфует в китайский на пустой истории — пост-фильтр режет."""
     import re as _re
 
-    # 0) Замеряем длину input — для placeholder-fallback если выкосим всё
-    _input_len = len(text.strip())
-
-    # 1) Fenced JSON блоки с "name"
+    # Fenced JSON block с "name"
     text = _re.sub(
-        r"```(?:json)?\s*\{[^{}]*\"name\".*?\}\s*```",
+        r"```(?:json)?\s*\{\s*\"name\"\s*:.*?\}\s*```",
         "",
         text,
         flags=_re.DOTALL | _re.IGNORECASE,
     )
-    # 2) Голый top-level JSON {"name": "...", "arguments|parameters": {...}}
-    # Покрывает оба варианта (Ollama spec: arguments, Llama-leak: parameters).
+    # Голый top-level JSON tool-call
     text = _re.sub(
-        r"\{[^{}]*\"name\"\s*:\s*\"[A-Za-z_][\w-]*\"[^{}]*\"(?:arguments|parameters)\"\s*:\s*\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*\}",
+        r"\{\s*\"name\"\s*:\s*\"[A-Za-z_][A-Za-z0-9_]*\"\s*,\s*\"arguments\"\s*:\s*\{(?:[^{}]|\{[^{}]*\})*\}\s*\}",
         "",
         text,
         flags=_re.DOTALL,
     )
-    # 3) Pre-tool-call narration — фразы вида «я вызову инструмент X», «сейчас
-    # воспользуюсь web_search», «обращусь к функции», «нужно вызвать tool»
-    narration_patterns = [
-        r"[^.!?\n]*(?:вызову|вызовем|вызываю|выполню|выполняю|воспользуюсь|обращусь)\s+(?:инструмент(?:ом)?|функци[юей]|tool|web_search|websearch)[^.!?\n]*[.!?]?",
-        r"[^.!?\n]*(?:Поскольку\s+вы\s+попросили|Поскольку\s+пользователь\s+просит)[^.!?\n]*[.!?]?",
-        r"[^.!?\n]*(?:сейчас\s+поищу|сейчас\s+проверю)\s+(?:в\s+интернете|в\s+сети)[^.!?\n]*[.!?]?",
-    ]
-    for pat in narration_patterns:
-        text = _re.sub(pat, "", text, flags=_re.IGNORECASE)
-
-    # 4) Strip foreign-script symbols (CJK/Hangul/Hebrew/Arabic/Devanagari/Thai)
+    # Strip foreign-script symbols
     foreign_chars = _re.compile(
         "["
-        "\u4E00-\u9FFF"
-        "\u3040-\u309F"
-        "\u30A0-\u30FF"
-        "\uAC00-\uD7AF"
-        "\u3400-\u4DBF"
-        "\u0590-\u05FF"
-        "\u0600-\u06FF"
-        "\u0900-\u097F"
-        "\u0E00-\u0E7F"
+        "\u4E00-\u9FFF"   # CJK Unified Ideographs
+        "\u3040-\u309F"   # Hiragana
+        "\u30A0-\u30FF"   # Katakana
+        "\uAC00-\uD7AF"   # Hangul Syllables
+        "\u3400-\u4DBF"   # CJK Extension A
+        "\u0590-\u05FF"   # Hebrew
+        "\u0600-\u06FF"   # Arabic
+        "\u0900-\u097F"   # Devanagari
+        "\u0E00-\u0E7F"   # Thai
         "]+"
     )
+    original_len = len(text.strip())
     text = foreign_chars.sub("", text)
 
-    # 5) Уберём лишние пробелы/пустые строки
+    # Уберём лишние пробелы / пустые строки
     text = _re.sub(r"[ \t]{2,}", " ", text)
     text = _re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    # 6) Если из вменяемого input'а выкосили почти всё → placeholder
-    if _input_len > 20 and len(text) < 5:
-        return "У меня нет актуальных данных по этому запросу."
+    # Если выдрали почти всё → модель отдала только мусор
+    if original_len > 20 and len(text) < 5:
+        return "(модель выдала некорректный ответ — попробуй переспросить)"
     return text
 
 # ============================================================
@@ -629,13 +615,6 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
-# --- patch_runner hookup (auto-injected by inject_patch_runner.py) ---
-from pathlib import Path as _PR_Path
-from patch_runner_handler import register_patch_runner as _pr_register
-_pr_patches_dir = _PR_Path(__file__).parent.parent / "patches-incoming"
-_pr_register(dp, bot, _pr_patches_dir, 263280027)
-# --- end patch_runner hookup ---
 
 # --- file_clone hookup (auto-injected by inject-file-clone.sh) ---
 from pathlib import Path as _FC_Path
@@ -1480,37 +1459,6 @@ async def chat_handler(msg: Message):
             except Exception as e:
                 log.warning("save to ~/Documents failed: %s", e)
 
-        # Юра msg 17477: auto-copy admin uploads of .sh/.py/.bash/.patch в
-        # patches-incoming/ — для использования с /list_patches + /run_patch.
-        if msg.document and await db_is_admin(user_id):
-            try:
-                _patch_exts = {".sh", ".py", ".bash", ".patch"}
-                from pathlib import Path as _PR_Path
-                _fname = (msg.document.file_name or "").lower()
-                _ext = _PR_Path(_fname).suffix
-                if _ext in _patch_exts:
-                    _pr_inbox = _PR_Path(__file__).parent.parent / "patches-incoming"
-                    _pr_inbox.mkdir(parents=True, exist_ok=True)
-                    _pr_safe_name = "".join(c if c.isalnum() or c in "._- " else "_"
-                                            for c in (msg.document.file_name or f"patch-{int(time.time())}{_ext}"))
-                    _pr_target = _pr_inbox / _pr_safe_name.strip()
-                    if _pr_target.exists():
-                        _pr_target = _pr_inbox / f"{_pr_target.stem}-{int(time.time())}{_pr_target.suffix}"
-                    _pr_tg_file = await bot.get_file(msg.document.file_id)
-                    _pr_buf = await bot.download_file(_pr_tg_file.file_path)
-                    _pr_target.write_bytes(_pr_buf.read())
-                    _pr_size_kb = _pr_target.stat().st_size // 1024
-                    log.info("patch saved to patches-incoming: %s (%s KB)", _pr_target, _pr_size_kb)
-                    await msg.answer(
-                        f"📥 Принят patch: <code>{_pr_target.name}</code>\n"
-                        f"Сохранён в <code>patches-incoming/</code> ({_pr_size_kb} KB).\n\n"
-                        f"Запустить: <code>/run_patch {_pr_target.name}</code>\n"
-                        f"Список:    <code>/list_patches</code>"
-                    )
-            except Exception as e:
-                log.warning("patch auto-save failed: %s", e)
-
-
         # P3: document handling — если приехал PDF/DOCX, скачиваем в sandbox/uploads/
         # и подменяем user_text на инструкцию модели read_pdf/read_docx.
         if msg.document and msg.document.mime_type in (
@@ -1736,34 +1684,7 @@ async def chat_handler(msg: Message):
             sandbox = _Path(os.environ.get("BOT_SANDBOX", str(_Path.home() / "bot-workspace")))
             output_dir = sandbox / "output"
             if output_dir.exists():
-                # Anti-spurious-file guard (Юра msg 17435, 2026-05-17):
-                # auto-ship docx/png только если юзер реально просил файл/документ.
-                # Иначе модель over-eager (на "Супер!" создаёт супер.docx).
-                import re as _re_intent
-                _file_intent = _re_intent.compile(
-                    r"(?i)(\bфайл\w*|\bдокумент\w*|docx|pdf|\bотч[её]т\w*|\bсохрани|\bподготовь|\bсоставь|\bсделай\s+(?:файл|документ|отч))"
-                )
-                _image_intent = _re_intent.compile(
-                    r"(?i)(\bкартинк\w+|\bизображени\w+|\bрисунок\w*|\bphoto\b|\bimage\b|\bрендер\w*|\bсгенерируй|\bнарисуй)"
-                )
-                _user_text_for_intent = (user_text or "").strip()
-                _ship_docx = bool(_file_intent.search(_user_text_for_intent))
-                _ship_png = bool(_image_intent.search(_user_text_for_intent))
-                _html_intent = _re_intent.compile(
-                    r"(?i)(\bсайт\w*|\bстраниц\w*|\bлендинг\w*|\blanding\b|\bhtml\b|\bодностраничн\w*|\bвеб-?страниц\w*)"
-                )
-                _ship_html = bool(_html_intent.search(_user_text_for_intent))
-                if not _ship_html:
-                    log.info("html auto-ship skipped: no html-intent in user_text=%r",
-                            _user_text_for_intent[:60])
-                if not _ship_docx:
-                    log.info("docx auto-ship skipped: no file-intent in user_text=%r",
-                            _user_text_for_intent[:60])
-                if not _ship_png:
-                    log.info("png auto-ship skipped: no image-intent in user_text=%r",
-                            _user_text_for_intent[:60])
-                if _ship_docx:
-                  for docx_file in output_dir.glob("*.docx"):
+                for docx_file in output_dir.glob("*.docx"):
                     # Отправляем только файлы созданные в текущем запросе (последние 60 сек)
                     if time.time() - docx_file.stat().st_mtime < 60:
                         try:
@@ -1771,20 +1692,8 @@ async def chat_handler(msg: Message):
                             log.info("sent docx to user: %s", docx_file)
                         except Exception as e:
                             log.warning("send docx failed: %s", e)
-                # P3c: HTML auto-send — generate_html_page output (Юра msg 17443)
-                if _ship_html:
-                    for html_file in output_dir.glob("*.html"):
-                        if time.time() - html_file.stat().st_mtime < 60:
-                            try:
-                                await msg.answer_document(_FSInputFile(str(html_file)))
-                                log.info("sent html to user: %s", html_file)
-                            except Exception as e:
-                                log.warning("send html failed: %s", e)
                 # P3b: image auto-send — сгенерированные PNG из ComfyUI
-                if not _ship_png:
-                  pass  # auto-ship skipped, см. guard выше
-                else:
-                  for png_file in output_dir.glob("*.png"):
+                for png_file in output_dir.glob("*.png"):
                     if time.time() - png_file.stat().st_mtime < 60:
                         try:
                             await msg.answer_photo(_FSInputFile(str(png_file)))
