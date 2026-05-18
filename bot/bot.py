@@ -968,65 +968,32 @@ def get_nbrb_rate(currency: str = "USD", date: str | None = None) -> str:
 
 
 def get_gismeteo_weather(city: str = "Минск") -> str:
-    """Получить погоду через gismeteo.by HTML scrape. Возвращает текст без
-    упоминания источника."""
-    # Mapping городов → URL paths (расширяется по необходимости)
-    city_paths = {
-        "Минск": "minsk-4248",
-        "Брест": "brest-4079",
-        "Гомель": "gomel-4144",
-        "Витебск": "vitebsk-4263",
-        "Гродно": "grodno-4180",
-        "Могилёв": "mogilev-4326", "Могилев": "mogilev-4326",
-    }
-    city_norm = city.strip().capitalize()
-    path = city_paths.get(city_norm, "minsk-4248")
-    url = f"https://www.gismeteo.by/weather-{path}/now/"
+    """WTTR_WEATHER v13 2026-05-18.
+    Получить текущую погоду через wttr.in JSON API.
+    Совместимая сигнатура (имя оставлено для backward compat с _factual_routing).
+    Поддерживает любой город (не только РБ); fall-through к LLM в routing
+    остаётся для не-распознанных городов (v9 logic)."""
+    import urllib.parse as _up
+    city_q = _up.quote(city)
+    url = f"https://wttr.in/{city_q}?format=j1&lang=ru"
     try:
-        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
-        with _urlreq.urlopen(req, timeout=8) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        # Извлекаем температуру и описание через regex по содержанию страницы.
-        # Gismeteo использует aria-label с погодой; fallback на разные patterns.
-        temp_match = _re.search(r'now-weather__temperature[^>]*>\s*<[^>]*>\s*([+-]?\d+)', html)
-        if not temp_match:
-            temp_match = _re.search(r'"temperature":\s*([+-]?\d+)', html)
-        if not temp_match:
-            temp_match = _re.search(r'class="unit unit_temperature_c">([+-]?\d+)', html)
-        desc_match = _re.search(r'now-weather__description[^>]*>([^<]+)', html)
-        if not desc_match:
-            desc_match = _re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
-        temp = temp_match.group(1) if temp_match else "?"
-        desc = (desc_match.group(1).strip() if desc_match else "").split(".")[0][:120]
-        out = f"Сейчас в {city_norm}: {temp}°C"
-        if desc:
-            out += f". {desc}"
-        return out
-    except (_urlerr.URLError, _urlerr.HTTPError, TimeoutError) as exc:
-        return f"Не смог получить погоду в {city_norm}: {exc!r}"
-
-
-# Routing intent regex — для перехвата specific factual queries ДО web_search.
-_CURRENCY_INTENT_RE = _re.compile(
-    r"\bкурс\b.*\b(доллар|евро|рубл|usd|eur|rub|pln|gbp|cny|uah)|"
-    r"\b(доллар|евро|usd|eur)\b.*\bкурс\b|"
-    r"\b(какой|какая|какой\s+был|какой\s+стал)\s+курс\b|"
-    r"\bкурс\s+(на|был|за|сегодня|вчера|на выходных|в пятницу|в субботу|в понедельник|в воскресенье)\b",  # v10 ANTI_HALLUCINATION_CURRENCY broader currency intent match
-    _re.IGNORECASE | _re.UNICODE,
-)
-_WEATHER_INTENT_RE = _re.compile(
-    r"\b(погод|температур|какая\s+погода|сколько\s+градус|осадк|дожд|снег)\b",
-    _re.IGNORECASE | _re.UNICODE,
-)
-_CURRENCY_TOKEN_MAP = {
-    "доллар": "USD", "usd": "USD", "$": "USD",
-    "евро": "EUR", "eur": "EUR", "€": "EUR",
-    "рубл": "RUB", "rub": "RUB", "rur": "RUB",
-    "злот": "PLN", "pln": "PLN",
-    "фунт": "GBP", "gbp": "GBP",
-    "юан": "CNY", "cny": "CNY",
-    "гривн": "UAH", "uah": "UAH",
-}
+        req = _urlreq.Request(url, headers={"User-Agent": "curl/8.0"})
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        current = data.get("current_condition", [{}])[0]
+        temp_c = current.get("temp_C", "?")
+        feels_c = current.get("FeelsLikeC", temp_c)
+        desc_list = current.get("lang_ru") or current.get("weatherDesc", [])
+        desc = desc_list[0].get("value", "—") if desc_list else "—"
+        wind = current.get("windspeedKmph", "?")
+        humidity = current.get("humidity", "?")
+        return (
+            f"Погода в {city}: {temp_c}°C ({desc.lower()}), "
+            f"ощущается как {feels_c}°C. "
+            f"Ветер {wind} км/ч, влажность {humidity}%."
+        )
+    except (_urlerr.URLError, _urlerr.HTTPError, TimeoutError, ValueError, KeyError, IndexError) as exc:
+        return f"Не смог получить погоду для {city}: {exc!r}"
 
 
 def _detect_currency_token(text: str) -> str:
