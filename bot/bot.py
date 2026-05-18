@@ -1,3 +1,4 @@
+# v20 BOT_COMMANDS_MENU 2026-05-18 — Telegram commands menu с default+admin scope
 # v18 CONTEXT_WINDOW 2026-05-18 — num_ctx 8192 + HISTORY 30 + /context_show
 # v11 MULTICURRENCY_AND_SECURITY 2026-05-18 — multi-currency list + global security rule
 """Home AI Assistant Bot.
@@ -2270,6 +2271,60 @@ async def chat_handler(msg: Message):
 # ============================================================
 # main
 # ============================================================
+
+# v20 BOT_COMMANDS_MENU 2026-05-18 — set_my_commands для default + admin scope
+async def setup_commands_menu(bot, admin_ids: list[int]):
+    """Регистрирует commands в Telegram menu (кнопка с 3 полосками).
+
+    Default scope — для всех юзеров.
+    Admin scope — для каждого admin'а персонально (расширенный список).
+    """
+    from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+    # Команды для ВСЕХ юзеров
+    default_commands = [
+        BotCommand(command="start", description="Начать"),
+        BotCommand(command="profile", description="Мой профиль"),
+        BotCommand(command="profile_show", description="Показать профиль"),
+        BotCommand(command="profile_set", description="Задать профиль"),
+        BotCommand(command="profile_add", description="Добавить факт (или /profile_add Раздел -- факт)"),
+        BotCommand(command="profile_clear", description="Очистить профиль"),
+        BotCommand(command="reset", description="Сбросить историю диалога"),
+        BotCommand(command="context_show", description="Сколько контекста занято"),
+    ]
+    try:
+        await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+        log.info("bot_commands configured (default scope, %d commands)", len(default_commands))
+    except Exception as e:
+        log.warning("set_my_commands default failed: %s", e)
+
+    # Расширенные команды ТОЛЬКО для админов
+    admin_commands = default_commands + [
+        BotCommand(command="health", description="🛠 Состояние бота"),
+        BotCommand(command="health_detail", description="🛠 Детальная диагностика"),
+        BotCommand(command="stats", description="🛠 Статистика юзеров"),
+        BotCommand(command="add", description="🛠 Добавить юзера в whitelist"),
+        BotCommand(command="remove", description="🛠 Убрать юзера"),
+        BotCommand(command="list", description="🛠 Список whitelist"),
+        BotCommand(command="logs", description="🛠 Логи бота"),
+        BotCommand(command="restart", description="🛠 Перезапустить бот"),
+        BotCommand(command="restart_ollama", description="🛠 Перезапустить Ollama"),
+        BotCommand(command="git_status", description="🛠 Git статус"),
+        BotCommand(command="git_log", description="🛠 Git история"),
+        BotCommand(command="git_pull", description="🛠 Git pull"),
+        BotCommand(command="git_checkout", description="🛠 Git checkout"),
+        BotCommand(command="confirm_checkout", description="🛠 Подтвердить checkout"),
+        BotCommand(command="confirm_update", description="🛠 Подтвердить update"),
+        BotCommand(command="cancel_update", description="🛠 Отменить update"),
+    ]
+    for admin_id in admin_ids:
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            log.info("bot_commands configured for admin %s (%d commands)", admin_id, len(admin_commands))
+        except Exception as e:
+            log.warning("set_my_commands admin %s failed: %s", admin_id, e)
+
+
 async def main():
     await db_init()
     await _get_db()  # инициализируем singleton + WAL
@@ -2302,6 +2357,11 @@ async def main():
         register_startup_notice(dp, bot)
         # === features_pack auto-inject ===
         setup_feature_pack(dp, bot, [int(x) for x in os.environ.get('BOT_ADMIN_IDS', '').split(',') if x.strip()])
+                # v20 BOT_COMMANDS_MENU: настроить меню перед стартом polling
+        try:
+            await setup_commands_menu(bot, list(ADMIN_IDS) if isinstance(ADMIN_IDS, (set, list)) else [])
+        except Exception as e:
+            log.warning("commands menu setup failed: %s", e)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         worker.cancel()
