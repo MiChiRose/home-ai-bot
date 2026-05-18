@@ -1,3 +1,4 @@
+# v11 MULTICURRENCY_AND_SECURITY 2026-05-18 — multi-currency list + global security rule
 """Home AI Assistant Bot.
 
 Telegram-front для домашнего AI-сервера Юры (Ryzen 5 3500 + RTX 4060 + Pop_OS).
@@ -1029,6 +1030,9 @@ _CURRENCY_TOKEN_MAP = {
 
 
 def _detect_currency_token(text: str) -> str:
+    """v11: возвращает 'ALL' для плюрального intent ('курсы валют'), иначе одну валюту."""
+    if re.search(r"\bвалют\w*\b|\bкурсы\b|\bвсе\s+курс\w*|\bосновны\w+\s+курс\w*", text.lower()):
+        return "ALL"
     text_lower = text.lower()
     for token, code in _CURRENCY_TOKEN_MAP.items():
         if token in text_lower:
@@ -1047,6 +1051,34 @@ def _detect_city_token(text: str) -> str | None:
             return city.capitalize()
     return None  # let LLM handle non-Belarus cities via web_search
 
+
+
+
+def get_nbrb_rates_list(date: str | None = None,
+                        currencies: list[str] | None = None) -> str:
+    """v11 MULTICURRENCY_AND_SECURITY 2026-05-18.
+    Получить список курсов основных валют НБРБ.
+    Возвращает форматированную строку без упоминания источника."""
+    if currencies is None:
+        currencies = ["USD", "EUR", "RUB", "PLN", "CNY", "GBP"]
+    lines = []
+    actual_date = None
+    for cur in currencies:
+        result = get_nbrb_rate(cur, date=date)
+        if "BYN" not in result:
+            continue
+        # Парсим «1 X = Y BYN (на DATE)» в компактную строку
+        m = _re.match(r"(.+?)\s+=\s+([\d.]+)\s+BYN\s+\(на\s+([\d-]+)\)", result)
+        if m:
+            label, rate, date_str = m.groups()
+            lines.append(f"{label} = {rate} BYN")
+            actual_date = date_str
+        else:
+            lines.append(result)
+    if not lines:
+        return "Не удалось получить курсы валют."
+    header = f"Курсы валют на {actual_date}:\n" if actual_date else "Курсы валют:\n"
+    return header + "\n".join(lines)
 
 
 def _parse_date_token(text: str) -> str | None:
@@ -1117,6 +1149,8 @@ def try_factual_intent_routing(user_text: str):
     if _CURRENCY_INTENT_RE.search(user_text):
         cur = _detect_currency_token(user_text)
         date = _parse_date_token(user_text)
+        if cur == "ALL":
+            return get_nbrb_rates_list(date=date)
         return get_nbrb_rate(cur, date=date)
     if _WEATHER_INTENT_RE.search(user_text):
         city = _detect_city_token(user_text)
@@ -1906,6 +1940,11 @@ async def chat_handler(msg: Message):
                 "- Запрещены формулировки «курс был X», «цена около Y» если данные не получены через tool/search в этой сессии.\n"
                 "- Корректный ответ при отсутствии tool результата: «не могу проверить без актуальных данных, попробуй переформулировать или укажи дату».\n"
                 "- Это критично — пользователь принимает решения на основе цифр, hallucinated значения = реальный ущерб.\n\n"
+                "ГЛОБАЛЬНОЕ ПРАВИЛО БЕЗОПАСНОСТИ (v11 2026-05-18, обязательно):\n"
+                "- ЗАПРЕЩЕНО давать инструкции / советы / справочную информацию по следующим темам: производство, употребление или приобретение наркотиков; изготовление, модификация, обход правового регулирования оружия и взрывчатки; организация / содействие торговле людьми, рабству или принудительной эксплуатации; порнография любого характера и педофилия; организация суицида или членовредительства.\n"
+                "- АНАЛИЗИРУЙ КОНТЕКСТ ЦЕЛИКОМ — не блокируй ответ из-за одного слова. «Война» в контексте истории / литературы / новостей — норма. «Наркоз» в медицинском контексте — норма. «Огнестрельная травма» в первой помощи — норма. Запрет применяется только когда юзер реально запрашивает opera или знание для применения.\n"
+                "- При отказе: вежливо объясни что эту тему не обсуждаешь, предложи альтернативное направление разговора. Не читай нотации.\n"
+                "- Безопасные альтернативы для культурного диалога: история, наука, искусство, музыка, литература, языки, философия, путешествия, технологии, бытовые вопросы, психология (общая), личные интересы юзера, обучение, кулинария.\n\n"
                 "НОВОСТИ И ФАКТУАЛЬНЫЕ ЗАПРОСЫ ПО РБ (added v5c 2026-05-18):\n"
                 "- Новости Беларуси / события дня / происшествия — приоритет belta.by + onliner.by. Fallback: sb.by, kp.by, tut.by (architectural), tribuna.com (спорт), sportarena.by.\n"
                 "- Финансовые / курсы / экономика РБ — приоритет nbrb.by (Нацбанк, котировки официальные) + myfin.by (обменники). Fallback belmarket.by.\n"
