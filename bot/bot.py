@@ -936,14 +936,18 @@ import json as _json
 import re as _re
 
 
-def get_nbrb_rate(currency: str = "USD") -> str:
-    """Получить официальный курс валюты НБРБ. Возвращает форматированную строку
-    без упоминания источника."""
+def get_nbrb_rate(currency: str = "USD", date: str | None = None) -> str:
+    """Получить официальный курс валюты НБРБ. DATE_PARSING v7 2026-05-18.
+
+    date: optional YYYY-MM-DD. Если None — текущий курс.
+    Возвращает форматированную строку без упоминания источника."""
     cur = currency.upper().strip()
     cur_map = {"USD": "USD", "EUR": "EUR", "RUB": "RUB", "RUR": "RUB",
                "PLN": "PLN", "GBP": "GBP", "CNY": "CNY", "UAH": "UAH"}
     cur_code = cur_map.get(cur, cur)
     url = f"https://api.nbrb.by/exrates/rates/{cur_code}?parammode=2"
+    if date:
+        url += f"&ondate={date}"
     try:
         req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with _urlreq.urlopen(req, timeout=8) as resp:
@@ -1039,12 +1043,76 @@ def _detect_city_token(text: str) -> str:
     return "Минск"  # default
 
 
+
+def _parse_date_token(text: str) -> str | None:
+    """DATE_PARSING v7 2026-05-18.
+    Парсит relative/absolute date из user_text.
+    Returns YYYY-MM-DD or None если не нашёл."""
+    import datetime as _dt
+    import re as _re
+    text_l = text.lower()
+    today = _dt.date.today()
+
+    # «сегодня» → today
+    if _re.search(r"\bсегодня\b", text_l):
+        return today.isoformat()
+
+    # «вчера»
+    if _re.search(r"\bвчера\b", text_l):
+        return (today - _dt.timedelta(days=1)).isoformat()
+
+    # «позавчера»
+    if _re.search(r"\bпозавчера\b", text_l):
+        return (today - _dt.timedelta(days=2)).isoformat()
+
+    # Дни недели — последний прошедший / ближайший
+    days = {"понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3,
+            "пятниц": 4, "суббот": 5, "воскресень": 6}
+    for stem, idx in days.items():
+        if stem in text_l:
+            # «в пятницу» / «в прошлую пятницу» — последний прошедший этот день
+            delta = (today.weekday() - idx) % 7
+            if delta == 0:
+                delta = 7  # сам сегодняшний день — берём прошлую неделю
+            return (today - _dt.timedelta(days=delta)).isoformat()
+
+    # Формат «15.05» / «15.05.2026»
+    m = _re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b", text)
+    if m:
+        d, mo, y = m.groups()
+        y = int(y) if y else today.year
+        try:
+            return _dt.date(y, int(mo), int(d)).isoformat()
+        except ValueError:
+            pass
+
+    # «15 мая» / «18 мая 2026»
+    months = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5,
+              "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
+              "ноябр": 11, "декабр": 12}
+    m = _re.search(r"\b(\d{1,2})\s+([а-я]{3,})(?:\s+(\d{4}))?\b", text_l)
+    if m:
+        d, mname, y = m.groups()
+        for stem, idx in months.items():
+            if mname.startswith(stem):
+                y = int(y) if y else today.year
+                try:
+                    return _dt.date(y, idx, int(d)).isoformat()
+                except ValueError:
+                    pass
+                break
+
+    return None
+
+
 def try_factual_intent_routing(user_text: str):
     """Попробовать перехватить specific factual query ДО LLM.
+    DATE_PARSING v7 2026-05-18 — поддержка «вчера / в пятницу / 15.05».
     Returns string ответа если перехвачено, None если query должна идти в LLM."""
     if _CURRENCY_INTENT_RE.search(user_text):
         cur = _detect_currency_token(user_text)
-        return get_nbrb_rate(cur)
+        date = _parse_date_token(user_text)
+        return get_nbrb_rate(cur, date=date)
     if _WEATHER_INTENT_RE.search(user_text):
         city = _detect_city_token(user_text)
         return get_gismeteo_weather(city)
