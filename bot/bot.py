@@ -1521,6 +1521,30 @@ async def chat_handler(msg: Message):
             await _react(msg, "🎉")
             return
 
+    # v6 (2026-05-18) — IMAGE_GEN_REMOVED: ranged hardcoded refusal.
+    # Если юзер просит сгенерировать/нарисовать картинку — отказ + список сайтов.
+    if user_text and not has_image and not has_voice and not msg.document:
+        import re as _re_v6
+        _img_intent_re = _re_v6.compile(
+            r"(?i)(\bкартинк\w+|\bизображени\w+|\bрисунок\w*|\bphoto\b|\bimage\b|\bрендер\w*|\bсгенерируй|\bнарисуй|\bdraw\b|\bgenerate.*image)"
+        )
+        if _img_intent_re.search(user_text):
+            await msg.answer(
+                "К сожалению, функция генерации картинок была удалена за ненадобностью.\n\n"
+                "Но могу подсказать бесплатные сервисы, где можно сгенерировать изображения:\n\n"
+                "1. <b>Bing Image Creator</b> — https://www.bing.com/create (DALL-E 3, бесплатно)\n"
+                "2. <b>Ideogram</b> — https://ideogram.ai (хорошо с текстом на картинках, 25/день free)\n"
+                "3. <b>Leonardo AI</b> — https://leonardo.ai (150 credits/день free)\n"
+                "4. <b>Krea AI</b> — https://krea.ai (real-time generation, free tier)\n"
+                "5. <b>Microsoft Designer</b> — https://designer.microsoft.com (free)\n"
+                "6. <b>Playground AI</b> — https://playground.com (1000 images/день free)",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await _react(msg, "🎉")
+            return
+
+
     # Bug 4 fix (2026-05-17): implicit onboarding-save.
     # Если у юзера ещё нет user_profile — первое текстовое сообщение
     # сохраняется как профиль и LLM-обработка пропускается (показываем
@@ -1797,6 +1821,10 @@ async def chat_handler(msg: Message):
                 "- Запрещено отвечать «не нашёл инструментов для ответа» или «нужны конкретные данные» на small-talk. Юзер просто общается — поддерживай беседу.\n"
                 "- Примеры правильного: «Я тоже работаю» → «Понимаю, продуктивного дня!» / «А кем работаешь?». «Привет» → «Привет! Чем помочь?». «Как дела» → «Всё хорошо, чем могу помочь?».\n"
                 "- web_search вызывай ТОЛЬКО когда юзер реально просит факт (курс, погода, новости, цены, конкретные данные). Не на каждое сообщение.\n\n"
+                "ГЕНЕРАЦИЯ КАРТИНОК ОТСУТСТВУЕТ (v6 2026-05-18):\n"
+                "- Ты НЕ умеешь генерировать изображения. ComfyUI/Stable Diffusion/DALL-E недоступны.\n"
+                "- Запросы на «нарисуй/сгенерируй/создай картинку» уже перехвачены до тебя — но если каким-то образом долетели, отвечай что эта функция была удалена за ненадобностью, и предложи альтернативу (Bing Image Creator, Ideogram, Leonardo).\n"
+                "- НЕ обещай нарисовать. НЕ говори «сейчас сгенерирую». Сразу отказ + альтернатива.\n\n"
                 "НОВОСТИ И ФАКТУАЛЬНЫЕ ЗАПРОСЫ ПО РБ (added v5c 2026-05-18):\n"
                 "- Новости Беларуси / события дня / происшествия — приоритет belta.by + onliner.by. Fallback: sb.by, kp.by, tut.by (architectural), tribuna.com (спорт), sportarena.by.\n"
                 "- Финансовые / курсы / экономика РБ — приоритет nbrb.by (Нацбанк, котировки официальные) + myfin.by (обменники). Fallback belmarket.by.\n"
@@ -1940,17 +1968,11 @@ async def chat_handler(msg: Message):
                                 log.info("sent html to user: %s", html_file)
                             except Exception as e:
                                 log.warning("send html failed: %s", e)
-                # P3b: image auto-send — сгенерированные PNG из ComfyUI
-                if not _ship_png:
-                  pass  # auto-ship skipped, см. guard выше
-                else:
-                  for png_file in output_dir.glob("*.png"):
-                    if time.time() - png_file.stat().st_mtime < 60:
-                        try:
-                            await msg.answer_photo(_FSInputFile(str(png_file)))
-                            log.info("sent png to user: %s", png_file)
-                        except Exception as e:
-                            log.warning("send png failed: %s", e)
+                # P3b: IMAGE_GEN_REMOVED v6 (2026-05-18) — PNG auto-ship выключен.
+                # Генерация картинок через ComfyUI больше не доступна.
+                # Если юзер reaches до этой ветки и output_dir/*.png существует —
+                # это stale файл, не отправляем.
+                pass
         except Exception as e:
             log.warning("docx auto-send check failed: %s", e)
 
@@ -1969,6 +1991,9 @@ async def chat_handler(msg: Message):
 
     await inference_queue.put(process)
 
+
+# IMAGE_GEN_REMOVED v6 (2026-05-18) — генерация картинок выпилена
+# (см. chat_handler image-intent early intercept + SYSTEM_PROMPT rule)
 
 # ============================================================
 # main
@@ -2050,7 +2075,7 @@ async def _error_to_admin(event: ErrorEvent):
 
         # ADMIN_USER_IDS может быть list[int] или set[int]; конвертим в iterable
         try:
-            _admins = list(ADMIN_USER_IDS)  # type: ignore[name-defined]
+            _admins = list(ADMIN_IDS)  # v6 fix: было ADMIN_USER_IDS (NameError → _admins=[] → no alerts)
         except NameError:
             _admins = []
         for admin_id in _admins:
