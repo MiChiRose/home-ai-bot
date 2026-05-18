@@ -1,0 +1,2175 @@
+"""Home AI Assistant Bot.
+
+Telegram-front для домашнего AI-сервера Юры (Ryzen 5 3500 + RTX 4060 + Pop_OS).
+Под капотом: aiogram 3 + Ollama (local LLM) + SQLite (state) + asyncio.Queue (rate limiting).
+
+Архитектура:
+1. Whitelist — middleware, отбраковывает не-allowlisted user_id
+2. Async queue — один inference в моменте (одна GPU), новые запросы стоят в очереди с ETA
+3. Router с double self-check — выбор модели (instruct / coder / vl) с верификацией
+4. Conversation history — последние N сообщений per user в SQLite
+5. Admin commands — /add, /remove, /list, /stats, /health
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import base64  # P4-mini: было внутри handler
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib  # P5
+import shutil  # P5
+import subprocess  # P5 (argv-form, не shell=True)
+import tarfile  # P5
+
+import aiosqlite
+import httpx
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, ReactionTypeEmoji  # P4-mini: reactions
+from dotenv import load_dotenv
+
+import re
+# ============================================================
+# Config (env)
+# ============================================================
+ROOT = Path(__file__).resolve().parent.parent  # ~/ai-assistant
+load_dotenv(ROOT / ".env")
+
+# P2: чтобы из bot.py можно было импортнуть пакет tools/ (~/ai-assistant/tools/)
+# вне зависимости от cwd при запуске. Делаем ДО from-import.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.llm_loop import chat_with_tools
+from tools.voice_stt import transcribe_voice  # P5 voice: STT через faster-whisper  # noqa: E402  (после sys.path patch)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+}
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+DB_PATH = Path(os.environ.get("DB_PATH", ROOT / "data" / "bot.db"))
+LOG_PATH = Path(os.environ.get("LOG_PATH", ROOT / "logs" / "bot.log"))
+
+# Модели — должны совпадать с теми, что Ollama скачал на P0
+# Bug 3 fix (2026-05-17): миграция Qwen → Gemma 3 как основная модель.
+# Qwen2.5 артефачит русским / даёт китайские вкрапления. Gemma 3 чище на ru.
+# TOOLS_MODEL остаётся qwen2.5 (см. .env) — Gemma не парсит Hermes tool-format.
+MODEL_INSTRUCT = os.environ.get("MODEL_INSTRUCT", "gemma3:12b")
+MODEL_CODER = os.environ.get("MODEL_CODER", "gemma3:12b")
+MODEL_VISION = os.environ.get("MODEL_VISION", "gemma3:12b")
+MODEL_ROUTER = os.environ.get("MODEL_ROUTER", MODEL_INSTRUCT)  # для классификации intent
+
+# Лимиты
+HISTORY_LIMIT_MESSAGES = int(os.environ.get("HISTORY_LIMIT_MESSAGES", "20"))
+RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "30"))
+QUEUE_MAX_SIZE = int(os.environ.get("QUEUE_MAX_SIZE", "100"))
+LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "300"))
+
+# ============================================================
+# Logging
+# ============================================================
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("home-ai-bot")
+
+
+# ============================================================
+# Bug 6 fix (2026-05-17): Markdown → Telegram-safe HTML
+# Модели часто выдают `###`, `**`, `` ` ``, ` ``` ` — Telegram с parse_mode=HTML
+# рендерит их литералами. Конвертим в <b>/<i>/<code>/<pre>/<a> перед отправкой.
+# ============================================================
+def md_to_tg_html(text: str) -> str:
+    if not text:
+        return text
+    import html as _html
+    import re as _re
+
+    # 1. Сначала вырезаем fenced code-блоки (```...```) в plain placeholders,
+    # чтобы их содержимое не схлопнули нижестоящие правила inline-форматирования.
+    placeholders: list[str] = []
+
+    def _stash_code(match: "_re.Match[str]") -> str:
+        body = match.group(1)
+        placeholders.append(f"<pre><code>{_html.escape(body)}</code></pre>")
+        return f"\x00CB{len(placeholders) - 1}\x00"
+
+    text = _re.sub(r"```(?:[a-zA-Z0-9_+\-]*)\n?(.*?)```", _stash_code, text, flags=_re.DOTALL)
+
+    # 2. inline-код `...`
+    def _stash_inline(match: "_re.Match[str]") -> str:
+        body = match.group(1)
+        placeholders.append(f"<code>{_html.escape(body)}</code>")
+        return f"\x00CB{len(placeholders) - 1}\x00"
+
+    text = _re.sub(r"`([^`\n]+)`", _stash_inline, text)
+
+    # 3. HTML-escape всего остального текста (вне placeholder'ов)
+    text = _html.escape(text)
+
+    # 4. Заголовки  #..###### → <b>...</b>
+    text = _re.sub(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", r"<b>\1</b>", text, flags=_re.MULTILINE)
+
+    # 5. Bold **text** / __text__ → <b>
+    text = _re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", text)
+    text = _re.sub(r"(?<!_)__([^_\n]+?)__(?!_)", r"<b>\1</b>", text)
+
+    # 6. Italic *text* / _text_ → <i>  (без захвата ** / __)
+    text = _re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    text = _re.sub(r"(?<!_)_(?!_)([^_\n]+?)(?<!_)_(?!_)", r"<i>\1</i>", text)
+
+    # 7. Ссылки [text](url) → <a href="url">text</a>
+    def _link(match: "_re.Match[str]") -> str:
+        label = match.group(1)
+        url = match.group(2)
+        # url был escapen на шаге 3, вернём амперсанд
+        url = url.replace("&amp;", "&")
+        return f'<a href="{url}">{label}</a>'
+
+    text = _re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _link, text)
+
+    # 8. Возвращаем code-плейсхолдеры обратно
+    def _restore(match: "_re.Match[str]") -> str:
+        idx = int(match.group(1))
+        return placeholders[idx]
+
+    text = _re.sub(r"\x00CB(\d+)\x00", _restore, text)
+    return text
+
+
+def strip_tool_call_leaks(text: str) -> str:
+    """Удаляет orphan tool-call JSON в plain text (включая Llama-style с
+    'parameters' и 'name' без 'arguments'), плюс strip иероглифов и фраз
+    объявления процесса работы («я вызову инструмент X»)."""
+    import re as _re
+
+    # 0) Замеряем длину input — для placeholder-fallback если выкосим всё
+    _input_len = len(text.strip())
+
+    # 1) Fenced JSON блоки с "name"
+    text = _re.sub(
+        r"```(?:json)?\s*\{[^{}]*\"name\".*?\}\s*```",
+        "",
+        text,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+    # 2) Голый top-level JSON {"name": "...", "arguments|parameters": {...}}
+    # Покрывает оба варианта (Ollama spec: arguments, Llama-leak: parameters).
+    text = _re.sub(
+        r"\{[^{}]*\"name\"\s*:\s*\"[A-Za-z_][\w-]*\"[^{}]*\"(?:arguments|parameters)\"\s*:\s*\{(?:[^{}]|\{[^{}]*\})*\}[^{}]*\}",
+        "",
+        text,
+        flags=_re.DOTALL,
+    )
+    # 3) Pre-tool-call narration — фразы вида «я вызову инструмент X», «сейчас
+    # воспользуюсь web_search», «обращусь к функции», «нужно вызвать tool»
+    narration_patterns = [
+        r"[^.!?\n]*(?:вызову|вызовем|вызываю|выполню|выполняю|воспользуюсь|обращусь)\s+(?:инструмент(?:ом)?|функци[юей]|tool|web_search|websearch)[^.!?\n]*[.!?]?",
+        r"[^.!?\n]*(?:Поскольку\s+вы\s+попросили|Поскольку\s+пользователь\s+просит)[^.!?\n]*[.!?]?",
+        r"[^.!?\n]*(?:сейчас\s+поищу|сейчас\s+проверю)\s+(?:в\s+интернете|в\s+сети)[^.!?\n]*[.!?]?",
+    ]
+    for pat in narration_patterns:
+        text = _re.sub(pat, "", text, flags=_re.IGNORECASE)
+
+    # 4) Strip foreign-script symbols (CJK/Hangul/Hebrew/Arabic/Devanagari/Thai)
+    foreign_chars = _re.compile(
+        "["
+        "\u4E00-\u9FFF"
+        "\u3040-\u309F"
+        "\u30A0-\u30FF"
+        "\uAC00-\uD7AF"
+        "\u3400-\u4DBF"
+        "\u0590-\u05FF"
+        "\u0600-\u06FF"
+        "\u0900-\u097F"
+        "\u0E00-\u0E7F"
+        "]+"
+    )
+    text = foreign_chars.sub("", text)
+
+    # 5) Уберём лишние пробелы/пустые строки
+    text = _re.sub(r"[ \t]{2,}", " ", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # 6) Если из вменяемого input'а выкосили почти всё → placeholder
+    if _input_len > 20 and len(text) < 5:
+        return "У меня нет актуальных данных по этому запросу."
+    return text
+
+# ============================================================
+# DB singleton — переиспользуемое соединение (perf-boost 2026-05-16)
+# Один connection вместо 6-10 connect/close per request. WAL mode + lock.
+# ============================================================
+_db_singleton: aiosqlite.Connection | None = None
+_db_lock = asyncio.Lock()
+
+# Кэш admin status (TTL=60s) — admin status не меняется минутами
+_admin_cache: dict[int, tuple[float, bool]] = {}
+_ADMIN_CACHE_TTL = 60.0
+
+
+async def _get_db() -> aiosqlite.Connection:
+    """Singleton aiosqlite connection. Lazy init."""
+    global _db_singleton
+    if _db_singleton is not None:
+        return _db_singleton
+    async with _db_lock:
+        if _db_singleton is None:
+            _db_singleton = await aiosqlite.connect(DB_PATH)
+            await _db_singleton.execute("PRAGMA journal_mode=WAL;")
+            await _db_singleton.execute("PRAGMA foreign_keys=ON;")
+            await _db_singleton.execute("PRAGMA synchronous=NORMAL;")
+            await _db_singleton.commit()
+            log.info("DB singleton initialized: %s (WAL)", DB_PATH)
+    return _db_singleton
+
+
+async def _db_close():
+    """Закрыть singleton при shutdown."""
+    global _db_singleton
+    if _db_singleton is not None:
+        await _db_singleton.close()
+        _db_singleton = None
+
+
+# ============================================================
+# Database helpers
+# ============================================================
+async def db_init():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DB_PATH.exists():
+        # первичная инициализация — schema.sql лежит рядом
+        schema_path = Path(__file__).parent / "schema.sql"
+        if not schema_path.exists():
+            log.error("schema.sql not found at %s", schema_path)
+            sys.exit(1)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.executescript(schema_path.read_text())
+            await db.commit()
+        log.info("SQLite initialized at %s", DB_PATH)
+
+
+async def db_lifecycle(event: str, details: dict | None = None):
+    db = await _get_db()
+    await db.execute(
+        "INSERT INTO bot_lifecycle (event, details) VALUES (?, ?)",
+        (event, json.dumps(details or {}, ensure_ascii=False)),
+    )
+    await db.commit()
+
+
+async def db_is_allowed(user_id: int) -> bool:
+    db = await _get_db()
+    async with db.execute(
+        "SELECT 1 FROM users WHERE user_id = ? LIMIT 1", (user_id,)
+    ) as c:
+        return (await c.fetchone()) is not None
+
+
+async def db_is_admin(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    # TTL cache 60s — admin status стабилен
+    cached = _admin_cache.get(user_id)
+    now = time.time()
+    if cached and (now - cached[0]) < _ADMIN_CACHE_TTL:
+        return cached[1]
+    db = await _get_db()
+    async with db.execute(
+        "SELECT role FROM users WHERE user_id = ?", (user_id,)
+    ) as c:
+        row = await c.fetchone()
+        result = row is not None and row[0] == "admin"
+    _admin_cache[user_id] = (now, result)
+    return result
+
+
+async def db_add_user(
+    user_id: int, username: str | None, display_name: str | None, role: str, added_by: int
+):
+    db = await _get_db()
+    await db.execute(
+        """INSERT INTO users (user_id, username, display_name, role, added_by)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               username = excluded.username,
+               display_name = excluded.display_name,
+               role = excluded.role""",
+        (user_id, username, display_name, role, added_by),
+    )
+    await db.commit()
+    _admin_cache.pop(user_id, None)  # invalidate
+
+
+async def db_remove_user(user_id: int) -> bool:
+    db = await _get_db()
+    cur = await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    await db.commit()
+    _admin_cache.pop(user_id, None)
+    return cur.rowcount > 0
+
+
+async def db_list_users() -> list[tuple]:
+    db = await _get_db()
+    async with db.execute(
+        "SELECT user_id, username, display_name, role, added_at, last_seen_at FROM users ORDER BY added_at"
+    ) as c:
+        return await c.fetchall()
+
+
+async def db_history(user_id: int, limit: int = HISTORY_LIMIT_MESSAGES) -> list[dict]:
+    db = await _get_db()
+    async with db.execute(
+        "SELECT role, content FROM messages WHERE user_id = ? ORDER BY ts DESC LIMIT ?",
+        (user_id, limit),
+    ) as c:
+        rows = list(await c.fetchall())
+    rows.reverse()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
+
+async def db_record_message(
+    user_id: int,
+    direction: str,
+    role: str,
+    content: str,
+    model: str | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    duration_ms: int | None = None,
+) -> int:
+    db = await _get_db()
+    cur = await db.execute(
+        """INSERT INTO messages (user_id, direction, role, content, model, tokens_in, tokens_out, duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, direction, role, content, model, tokens_in, tokens_out, duration_ms),
+    )
+    await db.commit()
+    return cur.lastrowid or 0
+
+
+async def db_record_route(
+    user_id: int, message_id: int, first: str, second: str, final: str, intent: str
+):
+    db = await _get_db()
+    await db.execute(
+        """INSERT INTO model_routes (user_id, message_id, first_choice, second_check, final_choice, intent_label)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (user_id, message_id, first, second, final, intent),
+    )
+    await db.commit()
+
+
+async def db_touch_seen(user_id: int):
+    db = await _get_db()
+    await db.execute(
+        "UPDATE users SET last_seen_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user_id,),
+    )
+    await db.commit()
+
+
+async def db_incr_usage(user_id: int, tokens_in: int, tokens_out: int):
+    bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    db = await _get_db()
+    await db.execute(
+        """INSERT INTO usage_stats (user_id, bucket_hour, requests, tokens_in, tokens_out)
+           VALUES (?, ?, 1, ?, ?)
+           ON CONFLICT(user_id, bucket_hour) DO UPDATE SET
+               requests = requests + 1,
+               tokens_in = tokens_in + excluded.tokens_in,
+               tokens_out = tokens_out + excluded.tokens_out""",
+        (user_id, bucket, tokens_in, tokens_out),
+    )
+    await db.commit()
+
+
+async def db_usage_this_hour(user_id: int) -> int:
+    bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    db = await _get_db()
+    async with db.execute(
+        "SELECT requests FROM usage_stats WHERE user_id = ? AND bucket_hour = ?",
+        (user_id, bucket),
+    ) as c:
+        row = await c.fetchone()
+        return row[0] if row else 0
+
+
+# ============================================================
+# P4-mini: reactions helper (не падает на ошибке)
+# ============================================================
+async def _react(msg: Message, emoji: str) -> None:
+    try:
+        await bot.set_message_reaction(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+    except Exception as e:
+        log.debug("set_message_reaction(%s) failed: %s", emoji, e)
+
+
+# ============================================================
+# P4-mini: user_profiles (долгосрочная память per-user)
+# ============================================================
+async def db_get_profile(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT profile_md FROM user_profiles WHERE user_id = ?", (user_id,)
+        ) as c:
+            row = await c.fetchone()
+            return row[0] if row else ""
+
+
+async def db_set_profile(user_id: int, profile_md: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO user_profiles (user_id, profile_md, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   profile_md = excluded.profile_md,
+                   updated_at = CURRENT_TIMESTAMP""",
+            (user_id, profile_md),
+        )
+        await db.commit()
+
+
+async def db_append_profile(user_id: int, addition: str) -> str:
+    """Добавляет строку к существующему профилю. Возвращает новый профиль."""
+    cur = await db_get_profile(user_id)
+    new = (cur + "\n" + addition.strip()).strip() if cur else addition.strip()
+    await db_set_profile(user_id, new)
+    return new
+
+
+async def db_clear_profile(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+async def db_clear_history(user_id: int) -> int:
+    """Очищает messages + model_routes для одного user_id. Возвращает сколько messages удалено."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        deleted = cur.rowcount or 0
+        await db.execute("DELETE FROM model_routes WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return deleted
+
+
+# ============================================================
+# Ollama HTTP client
+# ============================================================
+async def ollama_chat(
+    model: str,
+    messages: list[dict],
+    timeout: int = LLM_TIMEOUT_SECONDS,
+    images: list[str] | None = None,
+) -> tuple[str, dict]:
+    """Вызывает Ollama /api/chat. Возвращает (response_text, metadata)."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if images:
+        # для vision-моделей последнее сообщение получает images поле
+        if payload["messages"]:
+            payload["messages"][-1]["images"] = images
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        r.raise_for_status()
+        data = r.json()
+    msg = data.get("message", {})
+    return msg.get("content", ""), {
+        "eval_count": data.get("eval_count"),
+        "prompt_eval_count": data.get("prompt_eval_count"),
+        "total_duration_ns": data.get("total_duration"),
+    }
+
+
+# ============================================================
+# Router — double self-check на выбор модели
+# ============================================================
+ROUTER_PROMPT_FIRST = """Ты — классификатор намерений (intent classifier). Получаешь сообщение пользователя и определяешь, какая модель должна на него ответить.
+
+Доступны 3 модели:
+- "instruct" — общий чатер, для повседневных диалогов, вопросов, объяснений (default)
+- "coder" — программистские задачи: написать/отладить код, объяснить snippet, refactor, регулярки, shell-команды
+- "vl" — vision: если в сообщении есть прикреплённое изображение
+
+Ответь ТОЛЬКО одним словом: instruct, coder или vl. Без объяснений.
+
+Сообщение пользователя:
+---
+{user_text}
+---"""
+
+ROUTER_PROMPT_VERIFY = """Ты — верификатор выбора модели. Первая классификация дала ответ: "{first_choice}".
+
+Перепроверь, корректен ли этот выбор для сообщения ниже. Если согласен — ответь "same". Если не согласен — ответь одним словом: instruct, coder или vl (новый правильный выбор). Без объяснений.
+
+Доступны:
+- "instruct" — общий чатер
+- "coder" — программирование
+- "vl" — есть изображение
+
+Сообщение пользователя:
+---
+{user_text}
+---
+
+Первая классификация: {first_choice}
+Твой вердикт:"""
+
+
+_CODE_MARKERS = re.compile(r"(\bdef\s|\bclass\s|\bfunction\s|\bimport\s|```|\bSELECT\s|\bFROM\s|\bnpm\b|\bpip\s|^\s*\$\s|^\s*sudo\s)", re.MULTILINE | re.IGNORECASE)
+
+
+async def route_with_double_check(
+    user_text: str, has_image: bool
+) -> tuple[str, str, str, str]:
+    """Возвращает (first, second, final, intent_label).
+    Perf-boost: shortcut если очевидно text-only — skip 2 LLM-calls классификатора (~10-20 сек).
+    """
+    # Если изображение прикреплено — короткий путь, vl без верификации
+    if has_image:
+        return "vl", "vl", "vl", "image"
+
+    # Shortcut: короткий нон-кодовый текст → instruct (минус 2 LLM-call)
+    if user_text and len(user_text) < 500 and not _CODE_MARKERS.search(user_text):
+        return "instruct", "shortcut", "instruct", "общий"
+
+    # Первая классификация
+    first_msgs = [{"role": "user", "content": ROUTER_PROMPT_FIRST.format(user_text=user_text)}]
+    try:
+        first_raw, _ = await ollama_chat(MODEL_ROUTER, first_msgs, timeout=10)  # P4-mini
+        first = first_raw.strip().lower().split()[0] if first_raw.strip() else "instruct"
+    except Exception as e:
+        log.warning("router first-pass failed: %s — defaulting to instruct", e)
+        first = "instruct"
+
+    if first not in {"instruct", "coder", "vl"}:
+        first = "instruct"
+
+    # Верификация
+    verify_msgs = [
+        {
+            "role": "user",
+            "content": ROUTER_PROMPT_VERIFY.format(
+                user_text=user_text, first_choice=first
+            ),
+        }
+    ]
+    try:
+        verify_raw, _ = await ollama_chat(MODEL_ROUTER, verify_msgs, timeout=10)  # P4-mini
+        verify = verify_raw.strip().lower().split()[0] if verify_raw.strip() else "same"
+    except Exception as e:
+        log.warning("router verify-pass failed: %s — using first choice", e)
+        verify = "same"
+
+    if verify == "same" or verify not in {"instruct", "coder", "vl"}:
+        final = first
+        second_check = "same"
+    else:
+        final = verify
+        second_check = "changed"
+
+    # Не возвращаем vl если изображения реально нет
+    if final == "vl" and not has_image:
+        final = "instruct"
+
+    intent = {"instruct": "общий", "coder": "код", "vl": "картинка"}[final]
+    return first, second_check, final, intent
+
+
+def model_id_by_choice(choice: str) -> str:
+    return {
+        "instruct": MODEL_INSTRUCT,
+        "coder": MODEL_CODER,
+        "vl": MODEL_VISION,
+    }.get(choice, MODEL_INSTRUCT)
+
+
+# ============================================================
+# Queue (один inference в моменте)
+# ============================================================
+inference_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+inference_active = asyncio.Lock()
+
+
+async def inference_worker():
+    """Один worker, обрабатывает inference последовательно."""
+    while True:
+        task = await inference_queue.get()
+        async with inference_active:
+            try:
+                await task()
+            except Exception as e:
+                log.exception("inference task failed: %s", e)
+        inference_queue.task_done()
+
+
+# ============================================================
+# Bot
+# ============================================================
+if not BOT_TOKEN:
+    log.error("BOT_TOKEN не задан в .env — запуск невозможен")
+    sys.exit(1)
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+# --- patch_runner hookup (auto-injected by inject_patch_runner.py) ---
+from pathlib import Path as _PR_Path
+from patch_runner_handler import register_patch_runner as _pr_register
+_pr_patches_dir = _PR_Path(__file__).parent.parent / "patches-incoming"
+_pr_register(dp, bot, _pr_patches_dir, 263280027)
+# --- end patch_runner hookup ---
+
+# --- file_clone hookup (auto-injected by inject-file-clone.sh) ---
+from pathlib import Path as _FC_Path
+from file_clone_handler import register_file_clone as _fc_register
+_fc_register(
+    dp,
+    repo_root=_FC_Path('/home/linuxserver/ai-assistant').expanduser().resolve(),
+    bot_self_path=_FC_Path(__file__).resolve(),
+    admin_id=263280027,
+)
+# --- end file_clone hookup ---
+
+
+# --- broadcast hookup (auto-injected by inject-broadcast.sh) ---
+from broadcast_handler import register_broadcast as _bc_register
+async def _bc_list_recipients() -> list[int]:
+    db = await _get_db()
+    out: list[int] = []
+    async with db.execute("SELECT user_id FROM users") as cur:
+        async for row in cur:
+            out.append(int(row[0]))
+    return out
+async def _bc_is_admin(uid: int) -> bool:
+    return await db_is_admin(uid)
+_bc_register(dp, bot, _bc_list_recipients, _bc_is_admin)
+# --- end broadcast hookup ---
+
+
+
+# ============================================================
+# Middleware: whitelist + rate limit
+# ============================================================
+@dp.message.middleware()
+async def access_middleware(handler, event: Message, data):
+    user_id = event.from_user.id if event.from_user else 0
+
+    # Bootstrap: первый Admin из .env может ВСЕГДА (даже если ещё нет в DB)
+    if user_id in ADMIN_IDS:
+        # автоматически добавим в DB как admin при первом контакте
+        db = await _get_db()
+        async with db.execute(
+            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+        ) as c:
+            exists = await c.fetchone() is not None
+        if not exists:
+            await db_add_user(
+                user_id,
+                event.from_user.username,
+                event.from_user.full_name,
+                "admin",
+                user_id,
+            )
+            log.info("auto-added admin user_id=%s", user_id)
+        await db_touch_seen(user_id)
+        return await handler(event, data)
+
+    # Whitelist check
+    if not await db_is_allowed(user_id):
+        log.info("rejected user_id=%s (not in whitelist)", user_id)
+        await event.answer(
+            "Извини, у тебя нет доступа к этому боту. Если считаешь что должен — напиши админу."
+        )
+        return
+
+    # Rate limit
+    requests_this_hour = await db_usage_this_hour(user_id)
+    if requests_this_hour >= RATE_LIMIT_PER_HOUR:
+        await event.answer(
+            f"⏳ Достигнут лимит {RATE_LIMIT_PER_HOUR} запросов в час. "
+            "Попробуй через час."
+        )
+        return
+
+    await db_touch_seen(user_id)
+    return await handler(event, data)
+
+
+# ============================================================
+# Handlers
+# ============================================================
+@dp.message(CommandStart())
+async def start_handler(msg: Message):
+    # Bug 4 fix (2026-05-17):
+    #   1. Был SyntaxError-баг — двойной `+` без операнда между блоками →
+    #      `+ +(`. Из-за него /start падал в runtime, новый юзер видел
+    #      "Упс, что-то сломалось при обработке твоего запроса".
+    #   2. Новый юзер без профиля → запускаем onboarding (анкета); ответ юзера
+    #      сохраняется как user_profile в chat_handler (см. ниже implicit save).
+    is_admin = await db_is_admin(msg.from_user.id)
+    profile = await db_get_profile(msg.from_user.id)
+
+    if not profile:
+        # Первый вход — приветствие + анкета. Следующее сообщение юзера
+        # сохранится в user_profile (см. onboarding-save в chat_handler).
+        await msg.answer(
+            "👋 Привет! Я — Makee, твой персональный AI-собеседник.\n\n"
+            "Чтобы наши разговоры были по делу и в твоём стиле, давай быстро познакомимся. "
+            "Расскажи о себе одним сообщением:\n"
+            "• как тебя зовут или как лучше к тебе обращаться;\n"
+            "• чем увлекаешься, на какие темы любишь говорить;\n"
+            "• какой стиль общения комфортнее — дружеский, деловой, технический.\n\n"
+            "Эту инфу я запомню и буду учитывать в каждом ответе. "
+            "Если что-то поменяется — напиши <code>/profile</code> и обновим.\n\n"
+            "Готов начинать — спрашивай что угодно 🚀"
+        )
+        return
+
+    role_label = "админ" if is_admin else "пользователь"
+    text = (
+        f"Привет, {msg.from_user.first_name}! Я — твой домашний AI-помощник.\n\n"
+        f"Твоя роль: <b>{role_label}</b>\n\n"
+        "Просто напиши мне что-нибудь, и я отвечу. "
+        "Если приложишь картинку — могу её описать.\n\n"
+        "Полезные команды:\n"
+        "• /health — состояние бота\n"
+        "• /stats — твоя статистика\n"
+        "• /profile — твой долгосрочный профиль\n"
+        "• /reset — очистить мою историю переписки\n"
+    )
+    if is_admin:
+        text += (
+            "\nAdmin git/ops команды:\n"
+            "• /git_pull — pull-deploy сейчас\n"
+            "• /git_status — текущий commit + ahead/behind\n"
+            "• /git_log [N] — последние коммиты\n"
+            "• /git_checkout &lt;sha&gt; — rollback (с подтверждением)\n"
+            "• /restart — рестарт сервиса\n"
+            "• /restart_ollama — рестарт ollama\n"
+            "• /logs [N] — последние log lines\n"
+            "• /health_detail — расширенный health\n"
+            "\nАдмин-команды:\n"
+            "• /add &lt;user_id&gt; [@username] [name] — добавить пользователя\n"
+            "• /remove &lt;user_id&gt; — убрать пользователя\n"
+            "• /list — список пользователей\n"
+        )
+    await msg.answer(text)
+
+
+@dp.message(Command("health"))
+async def health_handler(msg: Message):
+    queue_size = inference_queue.qsize()
+    is_busy = inference_active.locked()
+    db = await _get_db()
+    async with db.execute("SELECT COUNT(*) FROM users") as c:
+        users_count = (await c.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM messages") as c:
+        messages_count = (await c.fetchone())[0]
+    # Ollama health
+    ollama_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            r = await client.get(f"{OLLAMA_URL}/api/tags")
+            ollama_ok = r.status_code == 200
+    except Exception:
+        ollama_ok = False
+    await msg.answer(
+        "🩺 <b>Bot health</b>\n\n"
+        f"• Ollama: {'✅ online' if ollama_ok else '❌ offline'} ({OLLAMA_URL})\n"
+        f"• Inference busy: {'🔄 yes' if is_busy else '⏸ no'}\n"
+        f"• Queue size: {queue_size}\n"
+        f"• Users in whitelist: {users_count}\n"
+        f"• Total messages logged: {messages_count}\n"
+        f"• DB: <code>{DB_PATH}</code>"
+    )
+
+
+@dp.message(Command("stats"))
+async def stats_handler(msg: Message):
+    user_id = msg.from_user.id
+    requests = await db_usage_this_hour(user_id)
+    db = await _get_db()
+    async with db.execute(
+        "SELECT COUNT(*) FROM messages WHERE user_id = ?", (user_id,)
+    ) as c:
+        total = (await c.fetchone())[0]
+    await msg.answer(
+        "📊 <b>Твоя статистика</b>\n\n"
+        f"• Запросов в текущем часе: {requests} / {RATE_LIMIT_PER_HOUR}\n"
+        f"• Всего сообщений: {total}"
+    )
+
+
+@dp.message(Command("add"))
+async def add_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("Эта команда только для админа.")
+    args = msg.text.split(maxsplit=3) if msg.text else []
+    if len(args) < 2 or not args[1].isdigit():
+        return await msg.answer(
+            "Использование: <code>/add &lt;user_id&gt; [@username] [name]</code>\n"
+            "Узнать user_id: попроси юзера написать боту @userinfobot"
+        )
+    new_uid = int(args[1])
+    username = args[2].lstrip("@") if len(args) >= 3 else None
+    name = args[3] if len(args) >= 4 else None
+    await db_add_user(new_uid, username, name, "user", msg.from_user.id)
+    await msg.answer(
+        f"✅ Добавил: <code>{new_uid}</code>"
+        + (f" (@{username})" if username else "")
+        + (f" — {name}" if name else "")
+    )
+
+
+@dp.message(Command("remove"))
+async def remove_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("Эта команда только для админа.")
+    args = msg.text.split(maxsplit=1) if msg.text else []
+    if len(args) < 2 or not args[1].isdigit():
+        return await msg.answer("Использование: <code>/remove &lt;user_id&gt;</code>")
+    target = int(args[1])
+    if target == msg.from_user.id:
+        return await msg.answer("Себя удалить нельзя.")
+    ok = await db_remove_user(target)
+    await msg.answer("✅ Удалил." if ok else "❌ Не нашёл такого user_id в whitelist.")
+
+
+@dp.message(Command("list"))
+async def list_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("Эта команда только для админа.")
+    users = await db_list_users()
+    if not users:
+        return await msg.answer("Whitelist пустой.")
+    lines = ["<b>Whitelist:</b>"]
+    for uid, username, name, role, added, seen in users:
+        label = name or (f"@{username}" if username else f"id={uid}")
+        lines.append(f"• <code>{uid}</code> {label} ({role})")
+    await msg.answer("\n".join(lines))
+
+
+# ============================================================
+# P4-mini: команды /reset, /profile, /profile_set, /profile_add, /profile_clear
+# ============================================================
+@dp.message(Command("reset"))
+async def reset_handler(msg: Message):
+    deleted = await db_clear_history(msg.from_user.id)
+    await msg.answer(f"🧹 История очищена ({deleted} сообщений удалено). "
+                     "Профиль не тронут — он работает long-term.")
+
+
+@dp.message(Command("profile"))
+async def profile_handler(msg: Message):
+    p = await db_get_profile(msg.from_user.id)
+    if p:
+        await msg.answer(f"🧠 <b>Твой профиль:</b>\n<pre>{p}</pre>\n\n"
+                         "Команды: /profile_set, /profile_add, /profile_clear")
+    else:
+        await msg.answer("🧠 Профиль пустой.\n\n"
+                         "Заполни через:\n"
+                         "• /profile_set &lt;текст&gt; — заменить весь профиль\n"
+                         "• /profile_add &lt;текст&gt; — добавить строчку\n\n"
+                         "Что писать: язык общения, твои предпочтения по стилю ответов, "
+                         "контекст работы, важные особенности. Профиль вкладывается в каждый запрос.")
+
+
+@dp.message(Command("profile_set"))
+async def profile_set_handler(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Использование: <code>/profile_set текст профиля</code>")
+    await db_set_profile(msg.from_user.id, parts[1].strip())
+    await msg.answer("✅ Профиль обновлён. Проверь через /profile")
+
+
+@dp.message(Command("profile_add"))
+async def profile_add_handler(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Использование: <code>/profile_add строка</code>")
+    new = await db_append_profile(msg.from_user.id, parts[1].strip())
+    await msg.answer(f"✅ Добавил. Текущий профиль:\n<pre>{new}</pre>")
+
+
+@dp.message(Command("profile_clear"))
+async def profile_clear_handler(msg: Message):
+    await db_clear_profile(msg.from_user.id)
+    await msg.answer("🧹 Профиль очищен.")
+
+
+# ============================================================
+# Git/ops Telegram commands (admin-only)
+# ============================================================
+import shutil as _shutil_gitops  # alias чтобы не конфликтовать
+import traceback
+import io
+from aiogram.types import BufferedInputFile, ErrorEvent
+from features_pack import setup_feature_pack
+from apply_command import register_apply_handler, register_startup_notice
+
+
+# ============================================================
+# Tool functions (v5 patch 2026-05-18) — direct factual sources
+# ============================================================
+import urllib.request as _urlreq
+import urllib.error as _urlerr
+import json as _json
+import re as _re
+
+
+def get_nbrb_rate(currency: str = "USD", date: str | None = None) -> str:
+    """Получить официальный курс валюты НБРБ. DATE_PARSING v7 2026-05-18.
+
+    date: optional YYYY-MM-DD. Если None — текущий курс.
+    Возвращает форматированную строку без упоминания источника."""
+    cur = currency.upper().strip()
+    cur_map = {"USD": "USD", "EUR": "EUR", "RUB": "RUB", "RUR": "RUB",
+               "PLN": "PLN", "GBP": "GBP", "CNY": "CNY", "UAH": "UAH"}
+    cur_code = cur_map.get(cur, cur)
+    url = f"https://api.nbrb.by/exrates/rates/{cur_code}?parammode=2"
+    if date:
+        url += f"&ondate={date}"
+    try:
+        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _urlreq.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        rate = data.get("Cur_OfficialRate")
+        scale = data.get("Cur_Scale", 1)
+        date = (data.get("Date") or "").split("T")[0]
+        name = data.get("Cur_Name", cur_code)
+        if rate is None:
+            return f"Не удалось получить курс {cur_code}."
+        # Если scale > 1, то rate указан за scale единиц
+        if scale and scale != 1:
+            return f"{scale} {name} = {rate} BYN (на {date})"
+        return f"1 {name} = {rate} BYN (на {date})"
+    except (_urlerr.URLError, _urlerr.HTTPError, TimeoutError, ValueError) as exc:
+        return f"Не смог получить актуальный курс {cur_code}: {exc!r}"
+
+
+def get_gismeteo_weather(city: str = "Минск") -> str:
+    """Получить погоду через gismeteo.by HTML scrape. Возвращает текст без
+    упоминания источника."""
+    # Mapping городов → URL paths (расширяется по необходимости)
+    city_paths = {
+        "Минск": "minsk-4248",
+        "Брест": "brest-4079",
+        "Гомель": "gomel-4144",
+        "Витебск": "vitebsk-4263",
+        "Гродно": "grodno-4180",
+        "Могилёв": "mogilev-4326", "Могилев": "mogilev-4326",
+    }
+    city_norm = city.strip().capitalize()
+    path = city_paths.get(city_norm, "minsk-4248")
+    url = f"https://www.gismeteo.by/weather-{path}/now/"
+    try:
+        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+        with _urlreq.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        # Извлекаем температуру и описание через regex по содержанию страницы.
+        # Gismeteo использует aria-label с погодой; fallback на разные patterns.
+        temp_match = _re.search(r'now-weather__temperature[^>]*>\s*<[^>]*>\s*([+-]?\d+)', html)
+        if not temp_match:
+            temp_match = _re.search(r'"temperature":\s*([+-]?\d+)', html)
+        if not temp_match:
+            temp_match = _re.search(r'class="unit unit_temperature_c">([+-]?\d+)', html)
+        desc_match = _re.search(r'now-weather__description[^>]*>([^<]+)', html)
+        if not desc_match:
+            desc_match = _re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html)
+        temp = temp_match.group(1) if temp_match else "?"
+        desc = (desc_match.group(1).strip() if desc_match else "").split(".")[0][:120]
+        out = f"Сейчас в {city_norm}: {temp}°C"
+        if desc:
+            out += f". {desc}"
+        return out
+    except (_urlerr.URLError, _urlerr.HTTPError, TimeoutError) as exc:
+        return f"Не смог получить погоду в {city_norm}: {exc!r}"
+
+
+# Routing intent regex — для перехвата specific factual queries ДО web_search.
+_CURRENCY_INTENT_RE = _re.compile(
+    r"\bкурс\b.*\b(доллар|евро|рубл|usd|eur|rub|pln|gbp|cny|uah)|"
+    r"\b(доллар|евро|usd|eur)\b.*\bкурс\b",
+    _re.IGNORECASE | _re.UNICODE,
+)
+_WEATHER_INTENT_RE = _re.compile(
+    r"\b(погод|температур|какая\s+погода|сколько\s+градус|осадк|дожд|снег)\b",
+    _re.IGNORECASE | _re.UNICODE,
+)
+_CURRENCY_TOKEN_MAP = {
+    "доллар": "USD", "usd": "USD", "$": "USD",
+    "евро": "EUR", "eur": "EUR", "€": "EUR",
+    "рубл": "RUB", "rub": "RUB", "rur": "RUB",
+    "злот": "PLN", "pln": "PLN",
+    "фунт": "GBP", "gbp": "GBP",
+    "юан": "CNY", "cny": "CNY",
+    "гривн": "UAH", "uah": "UAH",
+}
+
+
+def _detect_currency_token(text: str) -> str:
+    text_lower = text.lower()
+    for token, code in _CURRENCY_TOKEN_MAP.items():
+        if token in text_lower:
+            return code
+    return "USD"  # default
+
+
+def _detect_city_token(text: str) -> str:
+    text_lower = text.lower()
+    cities = ["минск", "брест", "гомель", "витебск", "гродно", "могилёв", "могилев"]
+    for city in cities:
+        if city in text_lower:
+            return city.capitalize()
+    return "Минск"  # default
+
+
+
+def _parse_date_token(text: str) -> str | None:
+    """DATE_PARSING v7 2026-05-18.
+    Парсит relative/absolute date из user_text.
+    Returns YYYY-MM-DD or None если не нашёл."""
+    import datetime as _dt
+    import re as _re
+    text_l = text.lower()
+    today = _dt.date.today()
+
+    # «сегодня» → today
+    if _re.search(r"\bсегодня\b", text_l):
+        return today.isoformat()
+
+    # «вчера»
+    if _re.search(r"\bвчера\b", text_l):
+        return (today - _dt.timedelta(days=1)).isoformat()
+
+    # «позавчера»
+    if _re.search(r"\bпозавчера\b", text_l):
+        return (today - _dt.timedelta(days=2)).isoformat()
+
+    # Дни недели — последний прошедший / ближайший
+    days = {"понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3,
+            "пятниц": 4, "суббот": 5, "воскресень": 6}
+    for stem, idx in days.items():
+        if stem in text_l:
+            # «в пятницу» / «в прошлую пятницу» — последний прошедший этот день
+            delta = (today.weekday() - idx) % 7
+            if delta == 0:
+                delta = 7  # сам сегодняшний день — берём прошлую неделю
+            return (today - _dt.timedelta(days=delta)).isoformat()
+
+    # Формат «15.05» / «15.05.2026»
+    m = _re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b", text)
+    if m:
+        d, mo, y = m.groups()
+        y = int(y) if y else today.year
+        try:
+            return _dt.date(y, int(mo), int(d)).isoformat()
+        except ValueError:
+            pass
+
+    # «15 мая» / «18 мая 2026»
+    months = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5,
+              "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
+              "ноябр": 11, "декабр": 12}
+    m = _re.search(r"\b(\d{1,2})\s+([а-я]{3,})(?:\s+(\d{4}))?\b", text_l)
+    if m:
+        d, mname, y = m.groups()
+        for stem, idx in months.items():
+            if mname.startswith(stem):
+                y = int(y) if y else today.year
+                try:
+                    return _dt.date(y, idx, int(d)).isoformat()
+                except ValueError:
+                    pass
+                break
+
+    return None
+
+
+def try_factual_intent_routing(user_text: str):
+    """Попробовать перехватить specific factual query ДО LLM.
+    DATE_PARSING v7 2026-05-18 — поддержка «вчера / в пятницу / 15.05».
+    Returns string ответа если перехвачено, None если query должна идти в LLM."""
+    if _CURRENCY_INTENT_RE.search(user_text):
+        cur = _detect_currency_token(user_text)
+        date = _parse_date_token(user_text)
+        return get_nbrb_rate(cur, date=date)
+    if _WEATHER_INTENT_RE.search(user_text):
+        city = _detect_city_token(user_text)
+        return get_gismeteo_weather(city)
+    return None
+async def _run_cmd(args: list[str], cwd: str | None = None, timeout: int = 60) -> tuple[int, str, str]:
+    """Запуск subprocess argv-form, timeout."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+        try:
+            sout, serr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", f"TIMEOUT {timeout}s"
+        return proc.returncode or 0, sout.decode("utf-8", errors="replace"), serr.decode("utf-8", errors="replace")
+    except Exception as e:
+        return -1, "", f"subprocess error: {e}"
+
+
+def _is_git_repo() -> bool:
+    return (ROOT / ".git").is_dir()
+
+
+@dp.message(Command("git_pull"))
+async def git_pull_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    if not _is_git_repo():
+        return await msg.answer("❌ Не git-репо. Сначала setup-github-init.sh.")
+    await msg.answer("🔄 Запускаю pull-deploy…")
+    deploy_script = ROOT / "scripts" / "pull-deploy.sh"
+    if not deploy_script.is_file():
+        return await msg.answer(f"❌ {deploy_script} не найден. Сначала setup-auto-pull.sh.")
+    rc, out, err = await _run_cmd(["bash", str(deploy_script)], cwd=str(ROOT), timeout=300)
+    log_file = ROOT / "data" / "auto-pull.log"
+    tail = ""
+    if log_file.exists():
+        tail_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+        tail = "\n".join(tail_lines)
+    if rc == 0:
+        await msg.answer(f"✅ Pull-deploy OK\n\n<pre>{tail[:2000]}</pre>")
+    else:
+        await msg.answer(f"⚠️ Pull-deploy rc={rc}\n\n<pre>{(tail + chr(10) + err)[:2000]}</pre>")
+
+
+@dp.message(Command("git_status"))
+async def git_status_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    if not _is_git_repo():
+        return await msg.answer("❌ Не git-репо.")
+    rc1, head_sha, _ = await _run_cmd(["git", "rev-parse", "HEAD"], cwd=str(ROOT), timeout=10)
+    rc2, head_msg, _ = await _run_cmd(["git", "log", "-1", "--format=%h %s (%an, %ar)"], cwd=str(ROOT), timeout=10)
+    await _run_cmd(["git", "fetch", "origin"], cwd=str(ROOT), timeout=30)
+    rc3, ahead_behind, _ = await _run_cmd(
+        ["git", "rev-list", "--left-right", "--count", "HEAD...origin/main"],
+        cwd=str(ROOT), timeout=10,
+    )
+    rc4, status, _ = await _run_cmd(["git", "status", "--short"], cwd=str(ROOT), timeout=10)
+    ahead, behind = "?", "?"
+    if rc3 == 0 and ahead_behind.strip():
+        parts = ahead_behind.strip().split()
+        if len(parts) == 2:
+            ahead, behind = parts[0], parts[1]
+    out = (
+        f"📦 <b>Git status</b>\n"
+        f"HEAD: <code>{head_msg.strip()[:120]}</code>\n"
+        f"Ahead: {ahead} / Behind: {behind} (vs origin/main)\n"
+        f"Dirty files:\n<pre>{(status.strip() or '(чисто)')[:1200]}</pre>"
+    )
+    await msg.answer(out)
+
+
+@dp.message(Command("git_log"))
+async def git_log_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    if not _is_git_repo():
+        return await msg.answer("❌ Не git-репо.")
+    args = (msg.text or "").split()
+    n = 5
+    if len(args) > 1 and args[1].isdigit():
+        n = max(1, min(int(args[1]), 30))
+    rc, log_out, _ = await _run_cmd(
+        ["git", "log", f"-{n}", "--oneline", "--decorate", "--graph"],
+        cwd=str(ROOT), timeout=10,
+    )
+    if rc != 0:
+        return await msg.answer("❌ git log упал")
+    await msg.answer(f"📜 <b>Last {n} commits:</b>\n<pre>{log_out[:3500]}</pre>")
+
+
+# Pending checkouts: user_id → {sha, expires_at}
+_PENDING_CHECKOUTS: dict[int, dict] = {}
+
+
+@dp.message(Command("git_checkout"))
+async def git_checkout_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    if not _is_git_repo():
+        return await msg.answer("❌ Не git-репо.")
+    args = (msg.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        return await msg.answer("Использование: <code>/git_checkout &lt;sha&gt;</code>\nПотом подтверди /confirm_checkout &lt;sha&gt;")
+    sha = args[1].strip()
+    rc, head_check, _ = await _run_cmd(["git", "rev-parse", sha], cwd=str(ROOT), timeout=10)
+    if rc != 0:
+        return await msg.answer(f"❌ Неизвестный commit: {sha}")
+    rc, log_one, _ = await _run_cmd(["git", "log", "-1", "--format=%h %s (%an)", sha], cwd=str(ROOT), timeout=10)
+    _PENDING_CHECKOUTS[msg.from_user.id] = {"sha": sha, "expires_at": time.time() + 60}
+    await msg.answer(
+        f"⚠️ <b>Готовлю checkout</b>\n"
+        f"Target: <code>{log_one.strip()}</code>\n\n"
+        f"Это сделает <code>git reset --hard {sha[:8]}</code> + рестарт бота.\n"
+        f"Подтверди в течение 60 сек: <code>/confirm_checkout {sha[:8]}</code>"
+    )
+
+
+@dp.message(Command("confirm_checkout"))
+async def confirm_checkout_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    args = (msg.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        return await msg.answer("Использование: <code>/confirm_checkout &lt;sha_prefix&gt;</code>")
+    sha_prefix = args[1].strip()
+    pending = _PENDING_CHECKOUTS.get(msg.from_user.id)
+    if not pending:
+        return await msg.answer("❌ Нет pending checkout'а. Сначала /git_checkout <sha>")
+    if time.time() > pending["expires_at"]:
+        _PENDING_CHECKOUTS.pop(msg.from_user.id, None)
+        return await msg.answer("⏱ Pending checkout протух")
+    if not pending["sha"].startswith(sha_prefix):
+        return await msg.answer(f"❌ SHA не совпадает: жду <code>{pending['sha'][:8]}…</code>")
+    _PENDING_CHECKOUTS.pop(msg.from_user.id, None)
+    rc, out, err = await _run_cmd(["git", "reset", "--hard", pending["sha"]], cwd=str(ROOT), timeout=30)
+    if rc != 0:
+        return await msg.answer(f"❌ git reset упал rc={rc}\n<pre>{err[:1000]}</pre>")
+    await msg.answer(f"✅ Checkout сделан: <code>{pending['sha'][:8]}</code>\nЗапускаю рестарт сервиса…")
+    unit_name = os.environ.get("BOT_SYSTEMD_UNIT", "home-ai-bot.service")
+    # restart через отдельный fire-and-forget — иначе бот убьёт сам себя до отправки
+    await asyncio.create_subprocess_exec(
+        "bash", "-c", f"sleep 1 && systemctl --user restart {unit_name}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+@dp.message(Command("restart"))
+async def restart_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    unit_name = os.environ.get("BOT_SYSTEMD_UNIT", "home-ai-bot.service")
+    await msg.answer(f"🔄 Рестартую <code>{unit_name}</code>… через 2 сек.")
+    # Fire-and-forget restart через 2 сек чтобы успеть отправить сообщение
+    await asyncio.create_subprocess_exec(
+        "bash", "-c", f"sleep 2 && systemctl --user restart {unit_name}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+@dp.message(Command("restart_ollama"))
+async def restart_ollama_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    # Ollama обычно system-service, нужен sudo. Делать через user-systemctl сначала, потом если ollama system — через sudo (если позволяет).
+    await msg.answer("🔄 Рестартую ollama (может занять 10-20 сек)…")
+    rc, out, err = await _run_cmd(["systemctl", "--user", "restart", "ollama"], timeout=30)
+    if rc == 0:
+        return await msg.answer("✅ Ollama (--user) перезапущена")
+    # Fallback: system-level
+    rc2, out2, err2 = await _run_cmd(["sudo", "-n", "systemctl", "restart", "ollama"], timeout=30)
+    if rc2 == 0:
+        await msg.answer("✅ Ollama (system) перезапущена")
+    else:
+        await msg.answer(
+            f"⚠️ Не смог перезапустить Ollama: user-rc={rc} system-rc={rc2}\n"
+            f"<pre>{(err + err2)[:1000]}</pre>\n"
+            f"Возможно sudo требует пароль. Запусти руками: <code>sudo systemctl restart ollama</code>"
+        )
+
+
+@dp.message(Command("logs"))
+async def logs_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    args = (msg.text or "").split()
+    n = 50
+    if len(args) > 1 and args[1].isdigit():
+        n = max(10, min(int(args[1]), 300))
+    unit_name = os.environ.get("BOT_SYSTEMD_UNIT", "home-ai-bot.service")
+    rc, out, err = await _run_cmd(
+        ["journalctl", "--user", "-u", unit_name, "-n", str(n), "--no-pager", "--output=short"],
+        timeout=30,
+    )
+    if rc != 0:
+        return await msg.answer(f"❌ journalctl упал: {err[:500]}")
+    # Truncate для Telegram (4096 max в одном сообщении)
+    text = out[-3500:] if len(out) > 3500 else out
+    await msg.answer(f"📋 <b>Last {n} log lines ({unit_name}):</b>\n<pre>{text}</pre>")
+
+
+@dp.message(Command("health_detail"))
+async def health_detail_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    parts: list[str] = ["🩺 <b>Bot health (detail)</b>"]
+
+    # Git status
+    if _is_git_repo():
+        rc, head_msg, _ = await _run_cmd(["git", "log", "-1", "--format=%h %s"], cwd=str(ROOT), timeout=10)
+        parts.append(f"📦 Git HEAD: <code>{head_msg.strip()[:100]}</code>")
+
+    # Ollama ps
+    rc, ps_out, _ = await _run_cmd(["ollama", "ps"], timeout=10)
+    if rc == 0:
+        parts.append(f"\n🧠 Ollama loaded:\n<pre>{ps_out.strip()[:800] or '(пусто)'}</pre>")
+
+    # nvidia-smi
+    rc, gpu, _ = await _run_cmd(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader"],
+        timeout=10,
+    )
+    if rc == 0:
+        parts.append(f"\n🎮 GPU: <code>{gpu.strip()[:200]}</code>")
+
+    # Queue + active
+    parts.append(f"\n⏳ Queue: {inference_queue.qsize()}, Busy: {'yes' if inference_active.locked() else 'no'}")
+
+    # Ollama API
+    ollama_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            r = await client.get(f"{OLLAMA_URL}/api/tags")
+            ollama_ok = r.status_code == 200
+    except Exception:
+        ollama_ok = False
+    parts.append(f"\n📡 Ollama API ({OLLAMA_URL}): {'✅' if ollama_ok else '❌'}")
+
+    await msg.answer("\n".join(parts))
+
+
+# ============================================================
+# P5: remote ops — self-update механизм через Telegram
+# ============================================================
+# In-memory pending updates с TTL 60 сек. Не persistent — после рестарта обнуляется
+# чтобы случайно не выполнился старый pending скрипт.
+_PENDING_UPDATES: dict[int, dict] = {}
+PENDING_TTL_SEC = 60
+UPDATE_TIMEOUT_SEC = 300
+UPDATES_DIR = ROOT / "updates"
+BACKUPS_DIR = ROOT / "backups"
+AUDIT_LOG = ROOT / "data" / "admin-actions.log"
+MAX_TAIL_LINES = 30
+
+
+def _audit(user_id: int, action: str, **fields) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat()
+    parts = [f"ts={ts}", f"user_id={user_id}", f"action={action}"]
+    for k, v in fields.items():
+        parts.append(f"{k}={v}")
+    with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+        f.write(" ".join(parts) + "\n")
+
+
+def _sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _make_backup() -> Path:
+    """Tar -czf project (без .venv/updates/backups/, sqlite через отдельный .backup snapshot)."""
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tar_path = BACKUPS_DIR / f"backup-{stamp}.tar.gz"
+    def _filter(tarinfo: tarfile.TarInfo):
+        skip = (".venv", "updates", "backups", "data/bot.db", "data/bot.db-wal",
+                "data/bot.db-shm", "__pycache__", ".pytest_cache", ".git")
+        if any(s in tarinfo.name for s in skip):
+            return None
+        return tarinfo
+    with tarfile.open(tar_path, "w:gz") as t:
+        t.add(str(ROOT), arcname=ROOT.name, filter=_filter)
+    if DB_PATH.exists():
+        db_backup = BACKUPS_DIR / f"bot-db-{stamp}.sqlite"
+        # argv-form, не shell=True — безопасно
+        subprocess.run(
+            ["sqlite3", str(DB_PATH), f".backup '{db_backup}'"],
+            check=False, timeout=30,
+        )
+    return tar_path
+
+
+async def _rollback_from_backup(backup_path: Path) -> tuple[bool, str]:
+    log_lines: list[str] = [f"Rollback from: {backup_path}"]
+    try:
+        with tarfile.open(backup_path, "r:gz") as t:
+            t.extractall(path=str(ROOT.parent))
+        log_lines.append("✅ tar.gz распакован")
+        return True, "\n".join(log_lines)
+    except Exception as e:
+        log_lines.append(f"✗ Rollback FAILED: {e}")
+        return False, "\n".join(log_lines)
+
+
+async def _run_update_script(script_path: Path) -> tuple[int, str, str]:
+    """Запуск bash-скрипта в argv-form (НЕ shell=True). Timeout по wait_for."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", str(script_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(ROOT),
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=UPDATE_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", f"TIMEOUT после {UPDATE_TIMEOUT_SEC} секунд"
+        return proc.returncode or 0, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode("utf-8", errors="replace")
+    except Exception as e:
+        return -1, "", f"subprocess error: {e}"
+
+
+def _tail(text: str, n: int = MAX_TAIL_LINES) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if len(lines) > n else text
+
+
+@dp.message(Command("confirm_update"))
+async def confirm_update_handler(msg: Message):
+    user_id = msg.from_user.id
+    if not await db_is_admin(user_id):
+        return await msg.answer("⛔ Только админ.")
+    args = (msg.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        return await msg.answer("Использование: <code>/confirm_update &lt;sha_prefix&gt;</code>")
+    sha_prefix = args[1].strip()
+
+    pending = _PENDING_UPDATES.get(user_id)
+    if not pending:
+        return await msg.answer("❌ Нет pending update'а. Кинь .sh файл <code>update-*.sh</code>")
+    if time.time() > pending["expires_at"]:
+        _PENDING_UPDATES.pop(user_id, None)
+        return await msg.answer("⏱ Pending update протух (>60 сек). Кинь файл заново.")
+    if not pending["sha"].startswith(sha_prefix):
+        return await msg.answer(f"❌ SHA не совпадает. Жду <code>{pending['sha'][:8]}…</code>")
+
+    _PENDING_UPDATES.pop(user_id, None)
+    script_path = Path(pending["path"])
+    script_name = pending["name"]
+    sha = pending["sha"]
+
+    await msg.answer(f"🔧 Бэкаплю проект перед запуском <code>{script_name}</code>…")
+    _audit(user_id, "update_start", sha=sha[:12], name=script_name)
+
+    try:
+        backup_path = _make_backup()
+    except Exception as e:
+        log.exception("backup failed: %s", e)
+        _audit(user_id, "update_aborted", reason="backup_failed", err=str(e)[:80])
+        return await msg.answer(f"❌ Backup упал: {e}\nUpdate отменён.")
+
+    await msg.answer(f"📦 Backup: <code>{backup_path.name}</code>. Запускаю (max {UPDATE_TIMEOUT_SEC} сек)…")
+
+    rc, stdout, stderr = await _run_update_script(script_path)
+    combined_log = f"=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}"
+
+    log_file = UPDATES_DIR / "done" / f"{sha[:12]}-{int(time.time())}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(combined_log, encoding="utf-8")
+
+    from aiogram.types import FSInputFile as _FSInputFile
+
+    if rc == 0:
+        _audit(user_id, "update_success", sha=sha[:12], rc=rc)
+        try:
+            shutil.move(str(script_path), str(UPDATES_DIR / "done" / script_path.name))
+        except Exception:
+            pass
+        await msg.answer(
+            f"✅ <b>Обновление успешно</b> (rc=0)\n"
+            f"Backup: <code>{backup_path.name}</code>\n\n"
+            f"<pre>{_tail(stdout, 15)[:1500]}</pre>"
+        )
+        try:
+            await msg.answer_document(_FSInputFile(str(log_file)))
+        except Exception:
+            pass
+    else:
+        _audit(user_id, "update_failed", sha=sha[:12], rc=rc)
+        try:
+            shutil.move(str(script_path), str(UPDATES_DIR / "failed" / script_path.name))
+        except Exception:
+            pass
+        await msg.answer(f"🔥 <b>Скрипт упал rc={rc}</b>. Делаю rollback из <code>{backup_path.name}</code>…")
+        rollback_ok, rollback_log = await _rollback_from_backup(backup_path)
+        rb_file = UPDATES_DIR / "failed" / f"rollback-{sha[:12]}-{int(time.time())}.log"
+        rb_file.write_text(rollback_log, encoding="utf-8")
+        _audit(user_id, "rollback", sha=sha[:12], success=rollback_ok)
+        if rollback_ok:
+            unit_name = os.environ.get("BOT_SYSTEMD_UNIT", "home-ai-bot.service")
+            await msg.answer(
+                f"♻️ Rollback успешен. Для надёжности рестарт сервиса:\n"
+                f"<code>systemctl --user restart {unit_name}</code>"
+            )
+        else:
+            await msg.answer(
+                f"⚠️ <b>Rollback ТОЖЕ упал.</b> Проверь руками: <code>{backup_path}</code>."
+            )
+        try:
+            await msg.answer_document(_FSInputFile(str(log_file)))
+            await msg.answer_document(_FSInputFile(str(rb_file)))
+        except Exception:
+            pass
+
+
+@dp.message(Command("cancel_update"))
+async def cancel_update_handler(msg: Message):
+    user_id = msg.from_user.id
+    if not await db_is_admin(user_id):
+        return await msg.answer("⛔ Только админ.")
+    if _PENDING_UPDATES.pop(user_id, None):
+        _audit(user_id, "update_cancelled")
+        await msg.answer("✅ Pending update отменён.")
+    else:
+        await msg.answer("Нет pending update'а.")
+
+
+# ============================================================
+# Main message handler
+# ============================================================
+# === catch-all-cmd-exclude fix ===
+@dp.message((F.text & ~F.text.startswith("/")) | F.photo | F.document | F.voice)
+async def chat_handler(msg: Message):
+    user_id = msg.from_user.id
+    user_text = (msg.text or msg.caption or "").strip()
+    has_image = bool(msg.photo)
+
+    has_voice = bool(msg.voice)
+    if not user_text and not has_image and not has_voice and not msg.document:
+        return  # ignore stickers / video_note / etc
+
+    # P4-mini: реакция «увидел» сразу
+    await _react(msg, "👀")
+
+    # Phase 5b (2026-05-18) — factual intent routing ДО LLM.
+    # Перехватываем currency / weather queries и отвечаем deterministic.
+    if user_text and not has_image and not has_voice and not msg.document:
+        try:
+            early_answer = try_factual_intent_routing(user_text)
+        except Exception as _exc:
+            early_answer = None
+            try:
+                print(f"[factual_routing] error: {_exc!r}", flush=True)
+            except Exception:
+                pass
+        if early_answer:
+            await msg.answer(early_answer)
+            await _react(msg, "🎉")
+            return
+
+    # v6 (2026-05-18) — IMAGE_GEN_REMOVED: ranged hardcoded refusal.
+    # Если юзер просит сгенерировать/нарисовать картинку — отказ + список сайтов.
+    if user_text and not has_image and not has_voice and not msg.document:
+        import re as _re_v6
+        _img_intent_re = _re_v6.compile(
+            r"(?i)(\bкартинк\w+|\bизображени\w+|\bрисунок\w*|\bphoto\b|\bimage\b|\bрендер\w*|\bсгенерируй|\bнарисуй|\bdraw\b|\bgenerate.*image)"
+        )
+        if _img_intent_re.search(user_text):
+            await msg.answer(
+                "К сожалению, функция генерации картинок была удалена за ненадобностью.\n\n"
+                "Но могу подсказать бесплатные сервисы, где можно сгенерировать изображения:\n\n"
+                "1. <b>Bing Image Creator</b> — https://www.bing.com/create (DALL-E 3, бесплатно)\n"
+                "2. <b>Ideogram</b> — https://ideogram.ai (хорошо с текстом на картинках, 25/день free)\n"
+                "3. <b>Leonardo AI</b> — https://leonardo.ai (150 credits/день free)\n"
+                "4. <b>Krea AI</b> — https://krea.ai (real-time generation, free tier)\n"
+                "5. <b>Microsoft Designer</b> — https://designer.microsoft.com (free)\n"
+                "6. <b>Playground AI</b> — https://playground.com (1000 images/день free)",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await _react(msg, "🎉")
+            return
+
+
+    # Bug 4 fix (2026-05-17): implicit onboarding-save.
+    # Если у юзера ещё нет user_profile — первое текстовое сообщение
+    # сохраняется как профиль и LLM-обработка пропускается (показываем
+    # подтверждение). Голос / фото / документ на первом сообщении —
+    # обрабатываются обычным flow, без onboarding-save.
+    if user_text and not has_image and not has_voice and not msg.document:
+        existing_profile = await db_get_profile(user_id)
+        if not existing_profile:
+            await db_set_profile(user_id, user_text)
+            await msg.answer(
+                "📝 Записал твой профиль! Теперь буду учитывать его в каждом ответе.\n"
+                "Если захочешь обновить — <code>/profile_set</code> или <code>/profile_add</code>.\n\n"
+                "Готов отвечать — спрашивай!"
+            )
+            await _react(msg, "🎉")
+            return
+
+    # Helper: progress-message который потом edit'нется финальным ответом
+    queue_pos = inference_queue.qsize()
+    progress_text = (
+        f"⏳ В очереди: {queue_pos + 1} перед тобой. ~{(queue_pos + 1) * 15} сек."
+        if queue_pos > 0
+        else "🤔 Обрабатываю запрос…"
+    )
+    try:
+        progress_msg = await msg.answer(progress_text)
+        progress_msg_id = progress_msg.message_id
+    except Exception as e:
+        log.warning("progress message failed: %s", e)
+        progress_msg_id = None
+
+    async def process():
+        nonlocal user_text
+        # P5: remote ops — admin кинул update-*.sh? Ловим ДО обычного PDF/DOCX handling.
+        if (msg.document and msg.document.file_name
+                and msg.document.file_name.startswith("update-")
+                and msg.document.file_name.endswith(".sh")):
+            if not await db_is_admin(user_id):
+                log.info("non-admin tried update upload: user_id=%s", user_id)
+                return
+            try:
+                UPDATES_DIR.mkdir(parents=True, exist_ok=True)
+                (UPDATES_DIR / "pending").mkdir(parents=True, exist_ok=True)
+                tg_file = await bot.get_file(msg.document.file_id)
+                buf = await bot.download_file(tg_file.file_path)
+                tmp_path = UPDATES_DIR / "pending" / f"tmp-{int(time.time())}.sh"
+                tmp_path.write_bytes(buf.read())
+                sha = _sha256_file(tmp_path)
+                final_path = UPDATES_DIR / "pending" / f"{sha[:12]}.sh"
+                tmp_path.rename(final_path)
+                size = final_path.stat().st_size
+                head = "\n".join(final_path.read_text(encoding="utf-8", errors="replace").splitlines()[:8])
+                _PENDING_UPDATES[user_id] = {
+                    "sha": sha, "path": str(final_path), "name": msg.document.file_name,
+                    "size": size, "expires_at": time.time() + PENDING_TTL_SEC, "head": head,
+                }
+                _audit(user_id, "update_pending", sha=sha[:12], name=msg.document.file_name, size=size)
+                await msg.answer(
+                    f"📥 Получил <code>{msg.document.file_name}</code>\n"
+                    f"SHA: <code>{sha[:12]}…</code>\n"
+                    f"Размер: {size} байт\n"
+                    f"Первые 8 строк:\n<pre>{head[:800]}</pre>\n\n"
+                    f"Подтверди в течение {PENDING_TTL_SEC} сек:\n"
+                    f"<code>/confirm_update {sha[:12]}</code>\n"
+                    f"Или отмени: <code>/cancel_update</code>"
+                )
+            except Exception as e:
+                log.exception("update upload failed: %s", e)
+                await msg.answer(f"❌ Не смог принять update-скрипт: {e}")
+            return
+  # P3 fix: assignment в document handler ниже делает user_text локальной без этого
+        start_ts = time.monotonic()
+        # save_any_file_to_documents — любой документ от admin'a копируется в ~/Documents/
+        if msg.document:
+            try:
+                from pathlib import Path as _Path
+                if await db_is_admin(user_id):
+                    docs_dir = _Path.home() / "Documents"
+                    docs_dir.mkdir(parents=True, exist_ok=True)
+                    fname_raw = msg.document.file_name or f"upload-{int(time.time())}"
+                    safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in fname_raw).strip() or f"file-{int(time.time())}"
+                    # Не перезаписываем — если файл с таким именем есть, добавляем timestamp
+                    target = docs_dir / safe_name
+                    if target.exists():
+                        stem = target.stem
+                        suffix = target.suffix
+                        target = docs_dir / f"{stem}-{int(time.time())}{suffix}"
+                    tg_file_any = await bot.get_file(msg.document.file_id)
+                    buf_any = await bot.download_file(tg_file_any.file_path)
+                    target.write_bytes(buf_any.read())
+                    size_kb = target.stat().st_size // 1024
+                    log.info("file saved to ~/Documents: %s (%s KB)", target, size_kb)
+                    await msg.answer(
+                        f"💾 Сохранил файл: <code>~/Documents/{target.name}</code>\n"
+                        f"Размер: {size_kb} KB, MIME: <code>{msg.document.mime_type or '?'}</code>"
+                    )
+            except Exception as e:
+                log.warning("save to ~/Documents failed: %s", e)
+
+        # Юра msg 17477: auto-copy admin uploads of .sh/.py/.bash/.patch в
+        # patches-incoming/ — для использования с /list_patches + /run_patch.
+        if msg.document and await db_is_admin(user_id):
+            try:
+                _patch_exts = {".sh", ".py", ".bash", ".patch"}
+                from pathlib import Path as _PR_Path
+                _fname = (msg.document.file_name or "").lower()
+                _ext = _PR_Path(_fname).suffix
+                if _ext in _patch_exts:
+                    _pr_inbox = _PR_Path(__file__).parent.parent / "patches-incoming"
+                    _pr_inbox.mkdir(parents=True, exist_ok=True)
+                    _pr_safe_name = "".join(c if c.isalnum() or c in "._- " else "_"
+                                            for c in (msg.document.file_name or f"patch-{int(time.time())}{_ext}"))
+                    _pr_target = _pr_inbox / _pr_safe_name.strip()
+                    if _pr_target.exists():
+                        _pr_target = _pr_inbox / f"{_pr_target.stem}-{int(time.time())}{_pr_target.suffix}"
+                    _pr_tg_file = await bot.get_file(msg.document.file_id)
+                    _pr_buf = await bot.download_file(_pr_tg_file.file_path)
+                    _pr_target.write_bytes(_pr_buf.read())
+                    _pr_size_kb = _pr_target.stat().st_size // 1024
+                    log.info("patch saved to patches-incoming: %s (%s KB)", _pr_target, _pr_size_kb)
+                    await msg.answer(
+                        f"📥 Принят patch: <code>{_pr_target.name}</code>\n"
+                        f"Сохранён в <code>patches-incoming/</code> ({_pr_size_kb} KB).\n\n"
+                        f"Запустить: <code>/run_patch {_pr_target.name}</code>\n"
+                        f"Список:    <code>/list_patches</code>"
+                    )
+            except Exception as e:
+                log.warning("patch auto-save failed: %s", e)
+
+
+        # P3: document handling — если приехал PDF/DOCX, скачиваем в sandbox/uploads/
+        # и подменяем user_text на инструкцию модели read_pdf/read_docx.
+        if msg.document and msg.document.mime_type in (
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ):
+            from pathlib import Path as _Path
+            sandbox = _Path(os.environ.get("BOT_SANDBOX", str(_Path.home() / "bot-workspace")))
+            uploads = sandbox / "uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            fname = msg.document.file_name or f"upload-{int(time.time())}"
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in fname)
+            local_path = uploads / safe_name
+            try:
+                tg_file = await bot.get_file(msg.document.file_id)
+                buf = await bot.download_file(tg_file.file_path)
+                local_path.write_bytes(buf.read())
+                log.info("document saved: %s (%s bytes)", local_path, local_path.stat().st_size)
+                hint = f"Юзер прислал документ uploads/{safe_name}. "
+                if msg.document.mime_type == "application/pdf":
+                    hint += "Используй read_pdf чтобы прочитать. "
+                else:
+                    hint += "Используй read_docx чтобы прочитать. "
+                if user_text:
+                    user_text = hint + "Запрос: " + user_text
+                else:
+                    user_text = hint + "Сделай краткое summary."
+            except Exception as e:
+                log.warning("document download failed: %s", e)
+                await msg.answer(f"Не смог скачать документ: {e}")
+                return
+
+        # P5 voice: если voice — скачиваем .oga, транскрибируем, подставляем text в user_text
+        if msg.voice:
+            from pathlib import Path as _Path
+            sandbox = _Path(os.environ.get("BOT_SANDBOX", str(_Path.home() / "bot-workspace")))
+            voice_dir = sandbox / "voice"
+            voice_dir.mkdir(parents=True, exist_ok=True)
+            oga_path = voice_dir / f"voice-{msg.message_id}-{int(time.time())}.oga"
+            try:
+                tg_file = await bot.get_file(msg.voice.file_id)
+                buf = await bot.download_file(tg_file.file_path)
+                oga_path.write_bytes(buf.read())
+                log.info("voice saved: %s (%s bytes)", oga_path, oga_path.stat().st_size)
+                ok_stt, text_or_err = await transcribe_voice(str(oga_path))
+                if ok_stt:
+                    transcript = text_or_err
+                    log.info("voice transcribed (%s chars)", len(transcript))
+                    # Если был caption — добавляем; иначе берём транскрипт целиком
+                    if user_text:
+                        user_text = user_text + " " + transcript
+                    else:
+                        user_text = transcript
+                    # Покажем юзеру что было распознано (отдельным сообщением, до основного ответа)
+                    try:
+                        await msg.answer(f"🎤 Распознал: <i>{transcript[:1500]}</i>")
+                    except Exception:
+                        pass
+                else:
+                    await msg.answer(f"❌ Не смог распознать голосовое: {text_or_err}")
+                    return
+            except Exception as e:
+                log.exception("voice handling failed: %s", e)
+                await msg.answer(f"❌ Ошибка обработки голосового: {e}")
+                return
+            finally:
+                # Не удаляем .oga сразу — лежит в sandbox/voice, можно потом cleanup'нуть
+                pass
+
+        # Скачиваем картинку (base64) если есть
+        image_b64 = None
+        MAX_IMAGE_BYTES = 5 * 1024 * 1024  # P4-mini: 5MB hard limit чтобы не OOM на 16GB RAM
+        if has_image:
+            try:
+                photo = msg.photo[-1]  # самый большой size
+                file = await bot.get_file(photo.file_id)
+                if file.file_size and file.file_size > MAX_IMAGE_BYTES:
+                    await msg.answer(f"Картинка больше {MAX_IMAGE_BYTES // 1024 // 1024} MB — слишком тяжёлая для vision-модели. Сожми и пришли заново.")
+                    return
+                buf = await bot.download_file(file.file_path)
+                raw = buf.read()
+                if len(raw) > MAX_IMAGE_BYTES:
+                    await msg.answer("Картинка превысила лимит после download — пропускаю.")
+                    return
+                image_b64 = base64.b64encode(raw).decode()
+            except Exception as e:
+                log.warning("photo download failed: %s", e)
+
+        # 1) Сохраняем входящее
+        in_msg_id = await db_record_message(
+            user_id, "in", "user", user_text or "[image]"
+        )
+
+        # 2) Router с double-check
+        first, second_check, final_choice, intent = await route_with_double_check(
+            user_text, has_image
+        )
+        await db_record_route(user_id, in_msg_id, first, second_check, final_choice, intent)
+
+        chosen_model = model_id_by_choice(final_choice)
+        log.info(
+            "user=%s intent=%s route=%s→%s model=%s",
+            user_id,
+            intent,
+            first,
+            final_choice,
+            chosen_model,
+        )
+
+        # 3) Собираем conversation history + system prompt
+        history = await db_history(user_id)
+        user_profile = await db_get_profile(user_id)  # P4-mini
+        system = {
+            "role": "system",
+            "content": (
+                "Ты — дружелюбный полезный домашний AI-помощник.\n"
+                "ВАЖНЫЕ ПРАВИЛА ЯЗЫКА (обязательно):\n"
+                "1. Всегда отвечай ИСКЛЮЧИТЕЛЬНО на русском языке. "
+                "Ни одного слова, иероглифа или символа на других языках. "
+                "Не вставляй китайский, английский, корейский или любой иной язык — даже в одно слово.\n"
+                "⚠️ САНКЦИЯ: если ты выдашь иероглиф (китайский/корейский/японский/иврит/арабский), автоматический пост-фильтр вырежет этот фрагмент. Если после фильтрации в ответе останется меньше нескольких символов — юзер вообще не получит твой ответ. Пиши строго кириллицей.\n"
+                "2. Используй только стандартные русские буквы и пунктуацию. "
+                "Никаких надстрочных или диакритических знаков (типа á, é, ñ).\n"
+                "3. Если хочешь использовать иностранный термин — пиши его кириллицей или избегай.\n\n"
+                "ИНСТРУМЕНТЫ (доступны на ветке instruct):\n"
+                "- web_search(query, max_results) — поиск в интернете для свежих фактов, новостей, цен, курсов валют.\n"
+                "- read_file(path), write_file(path, content), list_dir(path), search_files(pattern, path) — "
+                "работа с файлами в личной песочнице пользователя (BOT_SANDBOX).\n"
+                "Вызывай инструменты сам, когда они уместны. Передавай аргументы строго по JSON-схеме. "
+                "Не выдумывай содержимое веб-страниц или файлов — если не вызвал tool, не утверждай факт.\n\n"
+                "ПРОАКТИВНОСТЬ И TOOL-USE (Bug 5 fix 2026-05-17):\n"
+                "- НИКОГДА не предлагай юзеру «погуглить самому», «посмотреть на сайте X», «обратиться к дилеру» — ты обязан ответить сам.\n"
+                "- Если для ответа нужны свежие данные (погода, цены, новости, факты, наличие товара) — ВЫЗЫВАЙ web_search и отдавай готовый результат.\n"
+                "- НЕ давай списки сайтов в качестве ответа. Сайты можно упомянуть только как доп. ссылку ПОСЛЕ того как ты уже отдал основной ответ.\n"
+                "- Если web_search не нашёл нужного / недоступен / упал — честно скажи «не смог найти актуальные данные сейчас», БЕЗ перечисления сайтов для самостоятельного поиска.\n"
+                "- Никогда не вставляй сырой tool-call JSON (`{\"name\": ..., \"arguments\": ...}`) в финальный ответ юзеру — это служебный формат, юзер его не должен видеть.\n"
+                "- НЕ объявляй процесс работы. Запрещены фразы вида «сейчас поищу в интернете», «выполню поиск», «обращусь к web_search», «проверю на сайте». Юзеру нужен СРАЗУ результат, а не описание твоих действий. Молча вызывай tool, молча получай данные, отдавай готовый ответ.\n\n"
+                "БЕЛАРУСЬ — НЕЙТРАЛЬНЫЕ ИСТОЧНИКИ (added 2026-05-18):\n"
+                "- Если запрос упоминает Беларусь, Минск, областные центры (Брест, Гомель, Витебск, Гродно, Могилёв), белорусский рубль (BYN), курс рубля, погоду в РБ, спорт, культуру, цены, транспорт, события, праздники, бытовое — формируй web_search query с приоритетом нейтральных белорусских источников: belta.by (госагентство), onliner.by (commercial mainstream), sb.by (Беларусь Сегодня), myfin.by (финансы), nbrb.by (Нацбанк), president.gov.by, mil.by, belarus.by, belstat.gov.by, tribuna.com (спорт), sportarena.by, 42.tut.by, kp.by.\n"
+                "- ЯВНО НЕ ОБСУЖДАЙ И НЕ ИЩИ: оппозицию, протесты, выборы 2020, политзаключённых, санкции против РБ, миграционный кризис, BNR/БНК символы, оппозиционные СМИ (nashaniva, zerkalo, reform, euroradio, charter97, svaboda). Если пользователь спросит политику РБ — отвечай нейтрально или предложи обратиться к официальным источникам, не углубляйся.\n"
+                "- Указывай тип источника в ответе если уместно: государственный (belta.by, sb.by, president.gov.by), коммерческий mainstream (onliner.by, myfin.by, kp.by), специализированный (nbrb.by, mil.by).\n\n"
+                "SMALL-TALK И ПОДДЕРЖАНИЕ ДИАЛОГА (важно):\n"
+                "- На обычные диалоговые реплики («привет», «как дела», «я тоже работаю», «понял», «спасибо», «ок», и подобное) — ОТВЕЧАЙ как нормальный собеседник, ДРУЖЕЛЮБНО, БЕЗ web_search, БЕЗ tools. Это small-talk.\n"
+                "- Запрещено отвечать «не нашёл инструментов для ответа» или «нужны конкретные данные» на small-talk. Юзер просто общается — поддерживай беседу.\n"
+                "- Примеры правильного: «Я тоже работаю» → «Понимаю, продуктивного дня!» / «А кем работаешь?». «Привет» → «Привет! Чем помочь?». «Как дела» → «Всё хорошо, чем могу помочь?».\n"
+                "- web_search вызывай ТОЛЬКО когда юзер реально просит факт (курс, погода, новости, цены, конкретные данные). Не на каждое сообщение.\n\n"
+                "ГЕНЕРАЦИЯ КАРТИНОК — ПАССИВНОЕ ПРАВИЛО (v8 PASSIVE_IMAGE_RULE 2026-05-18):\n"
+                "- НЕ упоминай ничего про генерацию изображений, ComfyUI, Stable Diffusion, DALL-E пока пользователь явно не попросил нарисовать/сгенерировать.\n"
+                "- НЕ предупреждай заранее, не пиши «я не умею» по своей инициативе. Это создаёт шум — система уже перехватывает запросы про картинки автоматически.\n"
+                "- НЕ обещай нарисовать. НЕ говори «сейчас сгенерирую».\n"
+                "- Молчи про эту тему. Просто отвечай на то, что юзер реально спросил.\n\n"
+                "НОВОСТИ И ФАКТУАЛЬНЫЕ ЗАПРОСЫ ПО РБ (added v5c 2026-05-18):\n"
+                "- Новости Беларуси / события дня / происшествия — приоритет belta.by + onliner.by. Fallback: sb.by, kp.by, tut.by (architectural), tribuna.com (спорт), sportarena.by.\n"
+                "- Финансовые / курсы / экономика РБ — приоритет nbrb.by (Нацбанк, котировки официальные) + myfin.by (обменники). Fallback belmarket.by.\n"
+                "- Погода РБ — приоритет gismeteo.by + pogoda.by. НЕ давай tiktok/youtube ссылки на погоду.\n"
+                "- web_search query формируй с явными site:belta.by site:onliner.by операторами или конкретными доменами в тексте запроса.\n\n"
+                "НЕ УПОМИНАЙ ИСТОЧНИКИ В ФИНАЛЬНОМ ОТВЕТЕ (added v5c 2026-05-18):\n"
+                "- ЗАПРЕЩЕНО писать «По данным belta.by...», «Согласно onliner.by...», «Источник: nbrb.by», «Ссылка: ...», давать URL списком, перечислять домены.\n"
+                "- Юзер хочет ФАКТ, не библиографию. Просто: «Курс доллара на сегодня — 2.7535 BYN.» Без «по данным НБРБ».\n"
+                "- Если факт не подтверждён или конфликтные данные — скажи «не нашёл актуальных данных», БЕЗ списка сайтов для самостоятельной проверки.\n\n"
+
+
+                "ФОРМАТ ОТВЕТА:\n"
+                "- Не используй Markdown-заголовки (`###`, `##`) — пиши обычным текстом, выделяй жирным `**...**` только важное.\n"
+                "- Списки — обычные строки с дефисом или цифрой.\n\n"
+                "ПО СОДЕРЖАНИЮ:\n"
+                "- Отвечай кратко и по делу.\n"
+                "- Если не знаешь и инструменты не помогли — честно скажи «не знаю», не выдумывай.\n\n"
+                + ("ПЕРСОНАЛЬНЫЙ ПРОФИЛЬ ЮЗЕРА (вкладывается всегда, учитывай при ответе):\n" + user_profile if user_profile else "")
+            ),
+        }
+        # Bug 2 fix (2026-05-17): hardcode ru — добавляем явный язык-маркер
+        # к user message чтобы модель не дрейфовала в китайский / английский
+        # при пустой истории. В history записывается оригинал user_text.
+        user_text_for_llm = user_text + "\n\n[ВНИМАНИЕ: ответ строго на русском языке, без иероглифов и иностранных слов.]"
+        messages_for_llm = [system] + history + [{"role": "user", "content": user_text_for_llm}]
+
+        # 4) Вызываем модель
+        # P2: для ветки `instruct` идём через tool-loop (web_search + file ops).
+        # Для `coder` и `vl` — прямой ollama_chat без инструментов (там они не нужны
+        # и vision-модели Hermes-tool format обычно не понимают).
+        try:
+            if final_choice == "instruct" and not image_b64:
+                # P2: используем TOOLS_MODEL из .env (специально для tool calling — qwen2.5),
+                # а не chosen_model (=MODEL_INSTRUCT, обычно gemma4 которая Hermes tool format не умеет).
+                tools_model = os.environ.get("TOOLS_MODEL") or chosen_model
+                response_text, _ = await chat_with_tools(
+                    user_text_for_llm,
+                    history,
+                    model=tools_model,
+                    ollama_url=OLLAMA_URL,
+                    system_prompt=system["content"],
+                )
+                meta = {}
+            else:
+                response_text, meta = await ollama_chat(
+                    chosen_model,
+                    messages_for_llm,
+                    images=[image_b64] if image_b64 else None,
+                )
+        except httpx.TimeoutException:
+            await msg.answer("⏱ Ollama не ответила в течение тайм-аута. Попробуй ещё раз.")
+            await _react(msg, "😢")
+            return
+        except Exception as e:
+            log.exception("ollama call failed: %s", e)
+            await msg.answer(f"❌ Ошибка модели: {e}")
+            await _react(msg, "😢")
+            return
+
+        duration_ms = int((time.monotonic() - start_ts) * 1000)
+        tokens_in = meta.get("prompt_eval_count") or 0
+        tokens_out = meta.get("eval_count") or 0
+
+        # 5) Отправляем ответ — через edit progress-message (или fallback delete+answer)
+        final_text = response_text.strip() or "(пустой ответ от модели)"
+        TG_MAX = 4096  # Telegram message limit
+
+        async def _delete_progress():
+            if progress_msg_id is None:
+                return
+            try:
+                await bot.delete_message(msg.chat.id, progress_msg_id)
+            except Exception:
+                pass
+
+        # Bug 1 fix (2026-05-17): убран edit_message_text — Telegram не шлёт
+        # push-уведомление на edit, и юзер не понимает что ответ готов.
+        # Всегда удаляем placeholder и шлём финальный ответ новым сообщением.
+        # Bug 5+6 fix (2026-05-17): strip orphan tool-call JSON + markdown→HTML
+        # перед отправкой (parse_mode=HTML в DefaultBotProperties).
+        await _delete_progress()
+        final_text = md_to_tg_html(strip_tool_call_leaks(final_text))
+        if len(final_text) <= TG_MAX:
+            await msg.answer(final_text)
+        else:
+            # Telegram lim 4096 — режем на чанки по 4000
+            for i in range(0, len(final_text), 4000):
+                await msg.answer(final_text[i:i + 4000])
+
+        await _react(msg, "🎉" if response_text.strip() else "😢")
+
+        # P3: document handling — если модель создала docx в sandbox/output/,
+        # отправляем файл юзеру.
+        try:
+            from pathlib import Path as _Path
+            from aiogram.types import FSInputFile as _FSInputFile
+            sandbox = _Path(os.environ.get("BOT_SANDBOX", str(_Path.home() / "bot-workspace")))
+            output_dir = sandbox / "output"
+            if output_dir.exists():
+                # Anti-spurious-file guard (Юра msg 17435, 2026-05-17):
+                # auto-ship docx/png только если юзер реально просил файл/документ.
+                # Иначе модель over-eager (на "Супер!" создаёт супер.docx).
+                import re as _re_intent
+                _file_intent = _re_intent.compile(
+                    r"(?i)(\bфайл\w*|\bдокумент\w*|docx|pdf|\bотч[её]т\w*|\bсохрани|\bподготовь|\bсоставь|\bсделай\s+(?:файл|документ|отч))"
+                )
+                _image_intent = _re_intent.compile(
+                    r"(?i)(\bкартинк\w+|\bизображени\w+|\bрисунок\w*|\bphoto\b|\bimage\b|\bрендер\w*|\bсгенерируй|\bнарисуй)"
+                )
+                _user_text_for_intent = (user_text or "").strip()
+                _ship_docx = bool(_file_intent.search(_user_text_for_intent))
+                _ship_png = bool(_image_intent.search(_user_text_for_intent))
+                _html_intent = _re_intent.compile(
+                    r"(?i)(\bсайт\w*|\bстраниц\w*|\bлендинг\w*|\blanding\b|\bhtml\b|\bодностраничн\w*|\bвеб-?страниц\w*)"
+                )
+                _ship_html = bool(_html_intent.search(_user_text_for_intent))
+                if not _ship_html:
+                    log.info("html auto-ship skipped: no html-intent in user_text=%r",
+                            _user_text_for_intent[:60])
+                if not _ship_docx:
+                    log.info("docx auto-ship skipped: no file-intent in user_text=%r",
+                            _user_text_for_intent[:60])
+                if not _ship_png:
+                    log.info("png auto-ship skipped: no image-intent in user_text=%r",
+                            _user_text_for_intent[:60])
+                if _ship_docx:
+                  for docx_file in output_dir.glob("*.docx"):
+                    # Отправляем только файлы созданные в текущем запросе (последние 60 сек)
+                    if time.time() - docx_file.stat().st_mtime < 60:
+                        try:
+                            await msg.answer_document(_FSInputFile(str(docx_file)))
+                            log.info("sent docx to user: %s", docx_file)
+                        except Exception as e:
+                            log.warning("send docx failed: %s", e)
+                # P3c: HTML auto-send — generate_html_page output (Юра msg 17443)
+                if _ship_html:
+                    for html_file in output_dir.glob("*.html"):
+                        if time.time() - html_file.stat().st_mtime < 60:
+                            try:
+                                await msg.answer_document(_FSInputFile(str(html_file)))
+                                log.info("sent html to user: %s", html_file)
+                            except Exception as e:
+                                log.warning("send html failed: %s", e)
+                # P3b: IMAGE_GEN_REMOVED v6 (2026-05-18) — PNG auto-ship выключен.
+                # Генерация картинок через ComfyUI больше не доступна.
+                # Если юзер reaches до этой ветки и output_dir/*.png существует —
+                # это stale файл, не отправляем.
+                pass
+        except Exception as e:
+            log.warning("docx auto-send check failed: %s", e)
+
+        # 6) Сохраняем outgoing + статистику
+        await db_record_message(
+            user_id,
+            "out",
+            "assistant",
+            response_text,
+            model=chosen_model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            duration_ms=duration_ms,
+        )
+        await db_incr_usage(user_id, tokens_in, tokens_out)
+
+    await inference_queue.put(process)
+
+
+# IMAGE_GEN_REMOVED v6 (2026-05-18) — генерация картинок выпилена
+# (см. chat_handler image-intent early intercept + SYSTEM_PROMPT rule)
+
+# ============================================================
+# main
+# ============================================================
+async def main():
+    await db_init()
+    await _get_db()  # инициализируем singleton + WAL
+    await db_lifecycle("start", {"pid": os.getpid()})
+    log.info("Bot starting. Admins: %s. Ollama: %s", ADMIN_IDS, OLLAMA_URL)
+
+    # Pre-warm Ollama: грузим основные модели в VRAM при старте,
+    # чтобы первое сообщение пользователя летело без cold-load 30-60 сек
+    async def _prewarm():
+        tools_model = os.environ.get("TOOLS_MODEL") or MODEL_ROUTER or MODEL_INSTRUCT
+        log.info("pre-warming Ollama model: %s", tools_model)
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                await client.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={"model": tools_model, "prompt": "hi", "stream": False, "keep_alive": -1, "options": {"num_predict": 3}},
+                )
+            log.info("pre-warm done")
+        except Exception as e:
+            log.warning("pre-warm failed: %s (бот всё равно работает, просто первое сообщение будет холодным)", e)
+
+    prewarm_task = asyncio.create_task(_prewarm())
+
+    # Запускаем worker'а
+    worker = asyncio.create_task(inference_worker())
+
+    try:
+        # === apply_command auto-inject ===
+        register_apply_handler(dp, bot, [int(x) for x in os.environ.get('BOT_ADMIN_IDS', '').split(',') if x.strip()])
+        register_startup_notice(dp, bot)
+        # === features_pack auto-inject ===
+        setup_feature_pack(dp, bot, [int(x) for x in os.environ.get('BOT_ADMIN_IDS', '').split(',') if x.strip()])
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        worker.cancel()
+        await db_lifecycle("stop")
+        await _db_close()
+        log.info("Bot stopped.")
+
+
+
+# === ERROR_REPORTER_BLOCK ===
+# Глобальный error-handler: ловит unhandled exceptions из любого хэндлера
+# и шлёт админу полный traceback с контекстом. Установлен setup-error-reporter.sh.
+
+@dp.errors()
+async def _error_to_admin(event: ErrorEvent):
+    try:
+        exc = event.exception
+        update = event.update
+        msg = getattr(update, "message", None) or getattr(update, "callback_query", None)
+        if hasattr(msg, "message"):  # CallbackQuery -> message
+            msg = msg.message
+        user = getattr(msg, "from_user", None) if msg else None
+        user_id = user.id if user else "?"
+        user_name = (user.full_name if user else "") or ""
+        user_uname = ("@" + user.username) if (user and user.username) else ""
+        orig_text = ""
+        if msg is not None:
+            orig_text = (msg.text or msg.caption or "<no text>")
+        orig_short = orig_text[:400] + ("…" if len(orig_text) > 400 else "")
+
+        tb_full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        summary = f"{type(exc).__name__}: {exc}"
+
+        text = (
+            "🐞 Ошибка в боте\n\n"
+            f"👤 {user_name} {user_uname} (id: {user_id})\n"
+            f"💬 Запрос: {orig_short}\n"
+            f"🪲 {summary}"
+        )
+
+        fname = f"traceback-{user_id}-{int(time.time())}.txt"
+        doc = BufferedInputFile(tb_full.encode("utf-8"), filename=fname)
+
+        # ADMIN_USER_IDS может быть list[int] или set[int]; конвертим в iterable
+        try:
+            _admins = list(ADMIN_IDS)  # v6 fix: было ADMIN_USER_IDS (NameError → _admins=[] → no alerts)
+        except NameError:
+            _admins = []
+        for admin_id in _admins:
+            try:
+                await bot.send_message(admin_id, text)
+                await bot.send_document(admin_id, doc)
+            except Exception:
+                pass
+
+        if msg is not None and hasattr(msg, "reply"):
+            try:
+                await msg.reply("Упс, что-то сломалось при обработке твоего запроса. Я уже сообщил админу — починим.")
+            except Exception:
+                pass
+    except Exception:
+        # error-handler ВНУТРИ error-handler'а — последняя линия защиты
+        try:
+            print(traceback.format_exc(), flush=True)
+        except Exception:
+            pass
+
+    return True  # помечаем как обработанную
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
