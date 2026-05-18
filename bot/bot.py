@@ -1212,10 +1212,43 @@ def _parse_date_token(text: str) -> str | None:
     return None
 
 
+
+# v17 INTENT_REGEX_RESTORE 2026-05-18 — восстановлены ранее потерянные regex'ы
+# для intent routing. Объявлены ПЕРЕД try_factual_intent_routing.
+_CURRENCY_INTENT_RE = re.compile(
+    r"\bкурс\b.*\b(доллар|евро|рубл|usd|eur|rub|pln|gbp|cny|uah)|"
+    r"\b(доллар|евро|usd|eur)\b.*\bкурс\b|"
+    r"\b(какой|какая|какой\s+был|какой\s+стал)\s+курс\b|"
+    r"\bкурс\s+(на|был|за|сегодня|вчера|на\s+выходных|в\s+пятницу|в\s+субботу|в\s+понедельник|в\s+воскресенье)\b|"
+    r"\bвалют\w*\b|\bкурсы\b|\bвсе\s+курс\w*|\bосновны\w+\s+курс\w*",
+    re.IGNORECASE,
+)
+
+_WEATHER_INTENT_RE = re.compile(
+    r"\bпогод\w*\b|\bтемператур\w*\b|\bтемпература\s+воздуха|"
+    r"\bкакая\s+погода|\bсколько\s+градус\w*|\bкак\s+на\s+улице|"
+    r"\bдождь|\bснег\b|\bветер\b.*\b(сегодня|сейчас)",
+    re.IGNORECASE,
+)
+
+_ANALYTICAL_QUERY_RE = re.compile(
+    r"\b(почему|зачем|как\s+так|из-за\s+чего|по\s+какой\s+причине|"
+    r"причин\w+|тренд\w*|прогноз\w*|анализ\w*|фактор\w*|динамик\w+|"
+    r"объясни|расскажи\s+почему|why|how\s+come|reason|trend|forecast|analysis|"
+    r"что\s+влияет|какие\s+причины|с\s+чем\s+связан\w*|"
+    r"дешевеет|дорожает|растёт|падает|обвал|укрепление|ослабление|"
+    r"девальвация|инфляция)",
+    re.IGNORECASE,
+)
+
 def try_factual_intent_routing(user_text: str):
     """Попробовать перехватить specific factual query ДО LLM.
     DATE_PARSING v7 2026-05-18 — поддержка «вчера / в пятницу / 15.05».
     Returns string ответа если перехвачено, None если query должна идти в LLM."""
+        # v17 ANALYTICAL_BYPASS — аналитические запросы (почему/как/прогноз) → LLM
+    if _ANALYTICAL_QUERY_RE.search(user_text):
+        return None
+
     if _CURRENCY_INTENT_RE.search(user_text):
         cur = _detect_currency_token(user_text)
         date = _parse_date_token(user_text)
