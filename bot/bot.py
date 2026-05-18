@@ -1,3 +1,4 @@
+# v18 CONTEXT_WINDOW 2026-05-18 — num_ctx 8192 + HISTORY 30 + /context_show
 # v11 MULTICURRENCY_AND_SECURITY 2026-05-18 — multi-currency list + global security rule
 """Home AI Assistant Bot.
 
@@ -67,7 +68,7 @@ MODEL_VISION = os.environ.get("MODEL_VISION", "gemma3:12b")
 MODEL_ROUTER = os.environ.get("MODEL_ROUTER", MODEL_INSTRUCT)  # для классификации intent
 
 # Лимиты
-HISTORY_LIMIT_MESSAGES = int(os.environ.get("HISTORY_LIMIT_MESSAGES", "20"))
+HISTORY_LIMIT_MESSAGES = int(os.environ.get("HISTORY_LIMIT_MESSAGES", "30"))  # v18 CONTEXT_WINDOW 2026-05-18
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "30"))
 QUEUE_MAX_SIZE = int(os.environ.get("QUEUE_MAX_SIZE", "100"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "300"))
@@ -482,6 +483,7 @@ async def ollama_chat(
         "model": model,
         "messages": messages,
         "stream": False,
+        "options": {"num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "8192"))},  # v18 CONTEXT_WINDOW
     }
     if images:
         # для vision-моделей последнее сообщение получает images поле
@@ -1285,6 +1287,36 @@ def _is_git_repo() -> bool:
     return (ROOT / ".git").is_dir()
 
 
+@dp.message(Command("context_show"))
+async def cmd_context_show(msg: Message):
+    """v18 CONTEXT_WINDOW 2026-05-18 — диагностика context."""
+    user_id = msg.from_user.id
+    profile = await db_get_profile(user_id) or ""
+    history = await db_history(user_id)
+    history_bytes = sum(len(h['content'].encode('utf-8')) for h in history)
+    profile_bytes = len(profile.encode('utf-8'))
+    sys_bytes_est = 8000
+    total_bytes = sys_bytes_est + profile_bytes + history_bytes
+    total_tokens_est = total_bytes // 4
+    num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+    headroom = num_ctx - total_tokens_est
+    report = (
+        f"<b>📊 Context дamp</b>\n\n"
+        f"system prompt (est): ~{sys_bytes_est} bytes\n"
+        f"profile: {profile_bytes} bytes\n"
+        f"history: {len(history)} msgs / {history_bytes} bytes\n"
+        f"────────\n"
+        f"<b>total: ~{total_bytes} bytes / ~{total_tokens_est} tokens</b>\n"
+        f"Ollama num_ctx: {num_ctx}\n"
+        f"headroom: <b>{headroom}</b> tokens\n\n"
+    )
+    if headroom < 1000:
+        report += "⚠️ headroom &lt;1K — старое вытесняется. Подними OLLAMA_NUM_CTX=16384 в .env."
+    else:
+        report += "✅ headroom OK."
+    await msg.answer(report, parse_mode="HTML")
+
+
 @dp.message(Command("git_pull"))
 async def git_pull_handler(msg: Message):
     if not await db_is_admin(msg.from_user.id):
@@ -2055,6 +2087,11 @@ async def chat_handler(msg: Message):
                 "- Не переспрашивай «а какая у вас машина», «какая модель ноутбука» если ответ уже есть в анкете. Это раздражает юзера.\n"
                 "- Если в анкете нет нужной детали — тогда можно вежливо уточнить.\n"
                 "- Профиль может содержать ОТРИЦАТЕЛЬНЫЕ оговорки («EGR заглушен — из диагнозов исключать»). Учитывай и эти ограничения тоже.\n\n"
+                "ПАМЯТЬ КОНТЕКСТА (v18 CONTEXT_WINDOW 2026-05-18):\n"
+                "- Ты получаешь до 30 предыдущих сообщений диалога. ИСПОЛЬЗУЙ их.\n"
+                "- Если юзер недавно представился — НЕ переспрашивай и НЕ здоровайся повторно.\n"
+                "- Продолжай начатую тему, не рестартуй после reply.\n"
+                "- На неоднозначный reply («да», «ок») — смотри свой предыдущий ответ.\n\n"
                 "СТРУКТУРА ПРОФИЛЯ ЮЗЕРА (v15 MARKDOWN_PROFILE_STRUCTURE 2026-05-18):\n"
                 "- Профиль ниже может быть структурирован разделами через markdown заголовки `## Общее`, `## Техника`, `## Машина`, `## Здоровье`, `## Работа`, `## Интересы` и т.п. Парсь их явно — каждое имя раздела значимо.\n"
                 "- Если в запросе речь идёт про машину — ищи в `## Машина` (модель, год, мощность, ограничения как «EGR заглушен»). Про комп/ноутбук — `## Техника`. Про работу — `## Работа`. И т.д.\n"
@@ -2248,7 +2285,7 @@ async def main():
             async with httpx.AsyncClient(timeout=120) as client:
                 await client.post(
                     f"{OLLAMA_URL}/api/generate",
-                    json={"model": tools_model, "prompt": "hi", "stream": False, "keep_alive": -1, "options": {"num_predict": 3}},
+                    json={"model": tools_model, "prompt": "hi", "stream": False, "keep_alive": -1, "options": {"num_predict": 3, "num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "8192"))}}  # v18 CONTEXT_WINDOW,
                 )
             log.info("pre-warm done")
         except Exception as e:
