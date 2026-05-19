@@ -276,7 +276,7 @@ class GPUGuardMiddleware:
             STATS.gpu_blocked += 1
             try:
                 await event.answer(
-                    f"🔄 Подожди минуту, я ещё думаю над прошлым запросом."
+                    f"Очередь перегружена, попробуй позже."
                     f"Подожди минуту."
                 )
             except Exception:
@@ -376,10 +376,10 @@ def setup_feature_pack(dp, bot, admin_ids, responses_path=None):
     gpu_mw = GPUGuardMiddleware(gpu)
     typing_mw = TypingActionMiddleware(bot)
 
-    dp.message.middleware(rate_mw)
-    dp.message.middleware(conc_mw)
+    # dp.message.middleware(rate_mw)
+    # dp.message.middleware(conc_mw)
     dp.message.middleware(canned_mw)
-    dp.message.middleware(gpu_mw)
+    # dp.message.middleware(gpu_mw)
     dp.message.middleware(typing_mw)
 
     register_health_command(dp, bot, admin_set, gpu, conc_mw, canned)

@@ -8,9 +8,24 @@ from .document_ops import read_pdf, read_docx, write_docx
 from .image_gen import generate_image
 from .web_search import web_search
 from .html_gen import generate_html_page
+from .image_search import find_image
 
 
 TOOLS_SCHEMA: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "find_image",
+            "description": "Найти картинку в интернете и отправить пользователю. ✅ ВЫЗЫВАТЬ если юзер просит «найди картинку», «покажи фото», «как выглядит X».",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Что искать (например 'жираф', 'горы')."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -175,6 +190,7 @@ _FUNCS = {
     "write_docx":   write_docx,
     "generate_image": generate_image,
     "generate_html_page": generate_html_page,
+    "find_image": find_image,
 }
 
 

@@ -2316,7 +2316,22 @@ async def chat_handler(msg: Message):
         # Bug 5+6 fix (2026-05-17): strip orphan tool-call JSON + markdown→HTML
         # перед отправкой (parse_mode=HTML в DefaultBotProperties).
         await _delete_progress()
-        final_text = md_to_tg_html(strip_tool_call_leaks(final_text))
+        
+        # P8: [IMAGE_FOUND] intercept
+        if "[IMAGE_FOUND]" in response_text:
+            try:
+                import re as _re_img
+                match = _re_img.search(r"\[IMAGE_FOUND\] Файл сохранен: (.*)", response_text)
+                if match:
+                    img_path = match.group(1).strip()
+                    from aiogram.types import FSInputFile as _FSInputFile
+                    await msg.answer_photo(_FSInputFile(img_path))
+                    # Чистим текст от служебного маркера
+                    response_text = _re_img.sub("", response_text).strip()
+            except Exception as e:
+                log.warning("failed to send found image: %s", e)
+
+        final_text = md_to_tg_html(strip_tool_call_leaks(response_text))
         if len(final_text) <= TG_MAX:
             await msg.answer(final_text)
         else:
