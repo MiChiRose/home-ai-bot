@@ -667,8 +667,6 @@ async def _bc_is_admin(uid: int) -> bool:
 _bc_register(dp, bot, _bc_list_recipients, _bc_is_admin)
 # --- end broadcast hookup ---
 
-
-
 # ============================================================
 # Middleware: whitelist + rate limit
 # ============================================================
@@ -1022,8 +1020,6 @@ def _detect_city_token(text: str) -> str | None:
     return None  # let LLM handle non-Belarus cities via web_search
 
 
-
-
 def get_nbrb_rates_list(date: str | None = None,
                         currencies: list[str] | None = None) -> str:
     """v11 MULTICURRENCY_AND_SECURITY 2026-05-18.
@@ -1213,8 +1209,6 @@ def _parse_date_token(text: str) -> str | None:
                 break
 
     return None
-
-
 
 # v17 INTENT_REGEX_RESTORE 2026-05-18 — восстановлены ранее потерянные regex'ы
 # для intent routing. Объявлены ПЕРЕД try_factual_intent_routing.
@@ -1879,28 +1873,7 @@ async def chat_handler(msg: Message):
             await _react(msg, "🎉")
             return
 
-    # v6 (2026-05-18) — IMAGE_GEN_REMOVED: ranged hardcoded refusal.
-    # Если юзер просит сгенерировать/нарисовать картинку — отказ + список сайтов.
-    if user_text and not has_image and not has_voice and not msg.document:
-        import re as _re_v6
-        _img_intent_re = _re_v6.compile(
-            r"(?i)(\bкартинк\w+|\bизображени\w+|\bрисунок\w*|\bphoto\b|\bimage\b|\bрендер\w*|\bсгенерируй|\bнарисуй|\bdraw\b|\bgenerate.*image)"
-        )
-        if _img_intent_re.search(user_text):
-            await msg.answer(
-                "К сожалению, функция генерации картинок была удалена за ненадобностью.\n\n"
-                "Но могу подсказать бесплатные сервисы, где можно сгенерировать изображения:\n\n"
-                "1. <b>Bing Image Creator</b> — https://www.bing.com/create (DALL-E 3, бесплатно)\n"
-                "2. <b>Ideogram</b> — https://ideogram.ai (хорошо с текстом на картинках, 25/день free)\n"
-                "3. <b>Leonardo AI</b> — https://leonardo.ai (150 credits/день free)\n"
-                "4. <b>Krea AI</b> — https://krea.ai (real-time generation, free tier)\n"
-                "5. <b>Microsoft Designer</b> — https://designer.microsoft.com (free)\n"
-                "6. <b>Playground AI</b> — https://playground.com (1000 images/день free)",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            await _react(msg, "🎉")
-            return
+    
 
 
     # Bug 4 fix (2026-05-17): implicit onboarding-save.
@@ -2571,8 +2544,6 @@ async def main():
         await db_lifecycle("stop")
         await _db_close()
         log.info("Bot stopped.")
-
-
 
 # === ERROR_REPORTER_BLOCK ===
 # Глобальный error-handler: ловит unhandled exceptions из любого хэндлера
