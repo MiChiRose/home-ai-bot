@@ -40,13 +40,17 @@ async def _search_tavily(query: str, max_results: int) -> str:
 async def _search_ddg(query: str, max_results: int) -> str:
     # duckduckgo-search — sync API, оборачиваем в thread
     try:
-        from ddgs import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            from ddgs import DDGS
     except ImportError:
-        return "[web_search ERROR] pip install ddgs"
+        return "[web_search ERROR] pip install duckduckgo-search"
 
     def _do() -> list[dict]:
         with DDGS() as d:
-            return list(d.text(query, max_results=max_results))
+            # Используем region='ru-ru' или 'wt-wt' для обхода некоторых региональных блокировок
+            return list(d.text(query, region='wt-wt', max_results=max_results))
 
     try:
         rows = await asyncio.to_thread(_do)
@@ -64,7 +68,8 @@ async def _search_ddg(query: str, max_results: int) -> str:
 
 async def web_search(query: str, max_results: int = 5) -> str:
     """Поиск в интернете. Возвращает текст с топ-N результатами (markdown-ish)."""
-    provider = os.environ.get("WEB_SEARCH_PROVIDER", "tavily").lower()
+    # ПО УМОЛЧАНИЮ используем ddg, так как он работает из РБ без ключей
+    provider = os.environ.get("WEB_SEARCH_PROVIDER", "ddg").lower()
     max_results = max(1, min(int(max_results), 10))
     if provider == "tavily":
         return await _search_tavily(query, max_results)

@@ -3,3 +3,4 @@ aiogram>=3  # p2-tools
 aiosqlite>=0.19  # p2-tools
 python-dotenv>=1.0  # p2-tools
 ddgs  # p2-tools
+duckduckgo-search>=6.0.0

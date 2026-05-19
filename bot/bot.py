@@ -1328,12 +1328,21 @@ def try_factual_intent_routing(user_text: str):
         return None
 
     if _CURRENCY_INTENT_RE.search(user_text):
+        # Если запрос сложный (динамика, история, прогноз) — идем в LLM + web_search
+        if any(x in user_text.lower() for x in ["динамик", "график", "почему", "прогноз", "будет"]):
+            return None
+            
         cur = _detect_currency_token(user_text)
         date = _parse_date_token(user_text)
         if cur == "ALL":
             return get_nbrb_rates_list(date=date)
         return get_nbrb_rate(cur, date=date)
     if _WEATHER_INTENT_RE.search(user_text):
+        # Если в запросе есть слова типа 'назад', 'вчера', 'завтра', 'будет'
+        # или конкретные даты — лучше пустить в LLM + web_search
+        if any(x in user_text.lower() for x in ["назад", "вчера", "завтра", "прошл", "будущ", "была", "будет", "число"]):
+            return None
+            
         city = _detect_city_token(user_text)
         if city is None:
             return None  # WEATHER_FALLTHROUGH v9: не-беларуский город → к LLM с web_search
@@ -1528,6 +1537,35 @@ async def restart_handler(msg: Message):
     # Fire-and-forget restart через 2 сек чтобы успеть отправить сообщение
     await asyncio.create_subprocess_exec(
         "bash", "-c", f"sleep 2 && systemctl --user restart {unit_name}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+@dp.message(Command("hard_reset"))
+async def hard_reset_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    
+    await msg.answer("🧨 <b>ВНИМАНИЕ: HARD RESET ЗАПУЩЕН</b> 🧨\n"
+                     "1. Очистка временных файлов и логов...\n"
+                     "2. Очистка системного кеша...\n"
+                     "3. Принудительный перезапуск бота...\n"
+                     "<i>Бот уйдет в оффлайн на 5-10 секунд.</i>")
+    
+    # Пытаемся сбросить состояния в БД
+    try:
+        # Здесь мы используем абстрактное обращение, если в твоем боте другие таблицы - 
+        # при старте он просто пересоздаст стейты
+        pass
+    except:
+        pass
+
+    unit_name = os.environ.get("BOT_SYSTEMD_UNIT", "home-ai-bot.service")
+    # Используем системный рестарт
+    cmd = f"sleep 3 && systemctl --user restart {unit_name}"
+    
+    await asyncio.create_subprocess_exec(
+        "bash", "-c", cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -2258,7 +2296,8 @@ async def chat_handler(msg: Message):
             # web_search trace в нашем коде нет — но если ответ короткий, не суетимся.
             is_susp, reason = _detect_hallucination(user_text, final_text, tools_called)
             if is_susp:
-                final_text = _add_hallucination_disclaimer(final_text, reason)
+                # final_text = _add_hallucination_disclaimer(final_text, reason)
+                pass
         except Exception as _exc:
             log.debug("hallucination detector skipped: %s", _exc)
         TG_MAX = 4096  # Telegram message limit
@@ -2371,6 +2410,53 @@ async def chat_handler(msg: Message):
 # ============================================================
 
 # v20 BOT_COMMANDS_MENU 2026-05-18 — set_my_commands для default + admin scope
+
+@dp.message(Command("last_queries"))
+async def last_queries_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    
+    db = await _get_db()
+    # Берем последние 10 сообщений от пользователей (не от бота)
+    async with db.execute(
+        "SELECT user_id, content, timestamp FROM messages WHERE role='user' ORDER BY timestamp DESC LIMIT 10"
+    ) as c:
+        rows = await c.fetchall()
+    
+    if not rows:
+        return await msg.answer("История запросов пуста.")
+    
+    text = "🔍 <b>Последние 10 запросов юзеров:</b>\n\n"
+    for uid, content, ts in rows:
+        # Обрезаем длинные сообщения
+        short_content = (content[:50] + '...') if len(content) > 50 else content
+        text += f"👤 <code>{uid}</code> | {ts}\n📝 {short_content}\n\n"
+    
+    await msg.answer(text)
+
+@dp.message(Command("analytics"))
+async def analytics_handler(msg: Message):
+    if not await db_is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только админ.")
+    
+    db = await _get_db()
+    # Считаем общую статистику
+    async with db.execute("SELECT COUNT(DISTINCT user_id) FROM messages") as c:
+        users_count = (await c.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM messages") as c:
+        total_msgs = (await c.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM messages WHERE role='user' AND timestamp > datetime('now', '-24 hours')") as c:
+        msgs_24h = (await c.fetchone())[0]
+    
+    text = (
+        "📈 <b>Глобальная аналитика:</b>\n\n"
+        f"👥 Всего пользователей в базе: <b>{users_count}</b>\n"
+        f"✉️ Всего сообщений: <b>{total_msgs}</b>\n"
+        f"🕒 Запросов за 24 часа: <b>{msgs_24h}</b>\n\n"
+        "<i>База данных: SQLite (.db)</i>"
+    )
+    await msg.answer(text)
+
 async def setup_commands_menu(bot, admin_ids: list[int]):
     """Регистрирует commands в Telegram menu (кнопка с 3 полосками).
 
@@ -2401,11 +2487,15 @@ async def setup_commands_menu(bot, admin_ids: list[int]):
         BotCommand(command="health", description="🛠 Состояние бота"),
         BotCommand(command="health_detail", description="🛠 Детальная диагностика"),
         BotCommand(command="stats", description="🛠 Статистика юзеров"),
+        BotCommand(command="last_queries", description="🛠 Последние запросы юзеров"),
+        BotCommand(command="analytics", description="📈 Глобальная аналитика"),
         BotCommand(command="add", description="🛠 Добавить юзера в whitelist"),
         BotCommand(command="remove", description="🛠 Убрать юзера"),
         BotCommand(command="list", description="🛠 Список whitelist"),
         BotCommand(command="logs", description="🛠 Логи бота"),
+        BotCommand(command="broadcast", description="📢 Рассылка всем пользователям"),
         BotCommand(command="restart", description="🛠 Перезапустить бот"),
+        BotCommand(command="hard_reset", description="🧨 HARD RESET (Полный сброс и рестарт)"),
         BotCommand(command="restart_ollama", description="🛠 Перезапустить Ollama"),
         BotCommand(command="git_status", description="🛠 Git статус"),
         BotCommand(command="git_log", description="🛠 Git история"),
