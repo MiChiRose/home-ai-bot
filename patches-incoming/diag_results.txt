@@ -1,0 +1,76 @@
+=== DIAGNOSTIC REPORT (Вт 19 мая 2026 14:12:22 +03) ===
+
+--- Directory Structure ---
+.:
+add-belarus-search-bias-v2.sh
+add-belarus-search-bias-v3-autodetect-1779092280.sh
+add-belarus-search-bias-v3-autodetect.sh
+add-belarus-search-bias-v4-monolith.sh
+add-tools-v10-anti-hallucination-currency.sh
+add-tools-v11-multicurrency-and-security.sh
+add-tools-v12-extended-date-parser.sh
+add-tools-v13-wttr-weather.sh
+add-tools-v14-profile-aware-context.sh
+add-tools-v15-markdown-profile-structure.sh
+add-tools-v16-analytical-bypass.sh
+add-tools-v17-restore-intent-regex.sh
+add-tools-v18c-context-window-safe.sh
+add-tools-v18-context-window.sh
+add-tools-v19-git-storage-profiles.sh
+add-tools-v20-bot-commands-menu.sh
+add-tools-v21-general-anti-hallucination.sh
+add-tools-v22-runtime-hallucination-detector.sh
+add-tools-v5b-wire-handler.sh
+add-tools-v5c-news-and-nosources.sh
+add-tools-v5-currency-weather-news.sh
+add-tools-v6-remove-image-gen.sh
+add-tools-v7-currency-date-parsing.sh
+add-tools-v8-passive-image-rule.sh
+add-tools-v9-weather-fallthrough.sh
+bot-pulse.sh
+diag-ollama-400.sh
+diag_results.txt
+diag.sh
+dump-llm-loop.sh
+fix-bot-import-re.sh
+rollback-v18-and-retry.sh
+send-bot-logs-snippet-1779098517.sh
+send-bot-logs-snippet.sh
+send-bot-logs-snippet-v2-1779098414.sh
+send-bot-logs-snippet-v2.sh
+send-systemprompt-snippet-1779096556.sh
+send-systemprompt-snippet.sh
+trace-bot-no-sudo.sh
+trace-bot-ollama-payload.sh
+v19-auto-setup-profiles-repo.sh
+v19-setup-via-curl-no-gh.sh
+v23-performance-optimizations.sh
+
+--- Environment Variables (Ollama/Model related) ---
+OLLAMA_NUM_CTX=8192
+
+--- Ollama Status ---
+NAME                                          ID              SIZE      MODIFIED     
+llama3.1:8b                                   46e0c10c039e    4.9 GB    40 hours ago    
+gemma3:4b                                     a2af6cc3eb7f    3.3 GB    41 hours ago    
+gemma3:12b                                    f4031aab637d    8.1 GB    42 hours ago    
+qwen2.5:7b-instruct                           845dbda0ea48    4.7 GB    3 days ago      
+deepseek-coder-v2:16b-lite-instruct-q4_K_M    dac6ff6589c9    10 GB     3 days ago      
+gemma4:e4b                                    c6eb396dbd59    9.6 GB    3 days ago      
+gemma4:e2b                                    7fbdbf8f5e45    7.2 GB    3 days ago      
+nomic-embed-text:latest                       0a109f422b47    274 MB    3 days ago      
+qwen2.5vl:7b                                  5ced39dfa4ba    6.0 GB    3 days ago      
+qwen2.5-coder:7b                              dae161e27b0e    4.7 GB    3 days ago      
+qwen2.5:7b-instruct-q4_K_M                    845dbda0ea48    4.7 GB    3 days ago      
+--- Active Models ---
+NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL 
+
+--- Python Packages (httpx, ollama, aiogram) ---
+
+--- .env File (without secrets) ---
+.env file not found
+
+--- Last 50 lines of log.txt ---
+log.txt not found
+
+--- End of Report ---
